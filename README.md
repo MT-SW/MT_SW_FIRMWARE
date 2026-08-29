@@ -1,39 +1,127 @@
-<div align="center" markdown="1">
+<p align="center">
+  <img src="https://github.com/MT-SW/MT_SW_FIRMWARE/raw/develop/.github/meshtastic_logo.png" width="120" alt="MT_SW" />
+</p>
 
-<img src=".github/meshtastic_logo.png" alt="Meshtastic Logo" width="80"/>
-<h1>Meshtastic Firmware</h1>
+# MT_SW Firmware
 
-![GitHub release downloads](https://img.shields.io/github/downloads/meshtastic/firmware/total)
-[![CI](https://img.shields.io/github/actions/workflow/status/meshtastic/firmware/main_matrix.yml?branch=master&label=actions&logo=github&color=yellow)](https://github.com/meshtastic/firmware/actions/workflows/ci.yml)
-[![CLA assistant](https://cla-assistant.io/readme/badge/meshtastic/firmware)](https://cla-assistant.io/meshtastic/firmware)
-[![Fiscal Contributors](https://opencollective.com/meshtastic/tiers/badge.svg?label=Fiscal%20Contributors&color=deeppink)](https://opencollective.com/meshtastic/)
-[![Vercel](https://img.shields.io/static/v1?label=Powered%20by&message=Vercel&style=flat&logo=vercel&color=000000)](https://vercel.com?utm_source=meshtastic&utm_campaign=oss)
+Custom firmware fork for the **Świętokrzyskie (MT_SW)** LoRa mesh network, based on the official [meshtastic/firmware](https://github.com/meshtastic/firmware).
 
-<a href="https://trendshift.io/repositories/5524" target="_blank"><img src="https://trendshift.io/api/badge/repositories/5524" alt="meshtastic%2Ffirmware | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+🌐 [mt-sw.pl](https://mt-sw.pl)
 
-</div>
+---
 
-</div>
+## 🇵🇱 Polski
 
-<div align="center">
-	<a href="https://meshtastic.org">Website</a>
-	-
-	<a href="https://meshtastic.org/docs/">Documentation</a>
-</div>
+### Czym jest ten fork
 
-## Overview
+To zmodyfikowana wersja oficjalnego firmware'u Meshtastic, dostosowana do potrzeb regionalnej sieci mesh MT_SW (Świętokrzyskie). Zmiany obejmują rozszerzoną telemetrię, poprawki prywatności w MQTT, dodatkowe komendy czatu, nowe warianty sprzętowe oraz szereg poprawek stabilności.
 
-This repository contains the official device firmware for Meshtastic, an open-source LoRa mesh networking project designed for long-range, low-power communication without relying on internet or cellular infrastructure. The firmware supports various hardware platforms, including ESP32, nRF52, RP2040/RP2350, and Linux-based devices.
+### Co zmienia ten fork względem oficjalnego Meshtastic
 
-Meshtastic enables text messaging, location sharing, and telemetry over a decentralized mesh network, making it ideal for outdoor adventures, emergency preparedness, and remote operations.
+#### 📊 Telemetria i statystyki
+- **Statystyki `local_stats` po sieci mesh** — wysyłane automatycznie zaraz po standardowej telemetrii urządzenia, z tym samym interwałem co ona (domyślnie ustawiane w `userPrefs.jsonc`, np. co 2 godziny + naturalna kompensacja zależna od ruchu na sieci). W oficjalnym firmware `local_stats` trafia tylko do telefonu, nie na mesh.
+- **Nowy pakiet `local_stats_extended`** — dodatkowy typ telemetrii wysyłany tuż po `local_stats`, zawierający zużycie CPU (%), użycie flash (used/total) oraz RAM/PSRAM (free/total). CPU liczone jest z własnego licznika czasu zajętości pętli głównej (`startBusy()`/`endBusy()` w `main.cpp`), uśrednianego z ostatnich 60 sekund.
+- **Interwały telemetrii nie są już wymuszane do minimum roli** — usunięto (zakomentowano) mechanizm w `NodeDB.cpp`, który normalnie zaokrąglał skonfigurowane interwały telemetrii do minimalnej wartości zależnej od roli urządzenia na kanale domyślnym. Pozwala to np. na interwał 2h dla telemetrii urządzenia bez nadpisywania go przez firmware.
+- Domyślny interwał telemetrii urządzenia podniesiony do 2h, środowiskowej do 1h, pozycji do 12h (konfigurowalne w `userPrefs.jsonc`).
+- Limity pamięci na rekordy transmisji (offline message records) podwojone przy większych układach flash (np. 250→500 dla flash ≥15MB).
 
-### Get Started
+#### 🔒 Prywatność i MQTT
+- **Wiadomości prywatne (DM) nigdy nie trafiają na MQTT** — dodane zabezpieczenie w `Router.cpp` i `MQTT.cpp`: pakiety adresowane do konkretnego węzła (nie broadcast) są odrzucane przed uplinkiem do brokera, niezależnie od ustawień kanału. Bez tego DM odebrany i rozszyfrowany lokalnie przez węzeł pełniący rolę bramki mógł trafić do brokera w postaci jawnej.
+- **Pakiety przechodzące przez MQTT nie są flagowane jako `via_mqtt`** — zmieniono `p->via_mqtt = true` na `false` w `MQTT.cpp`, więc pakiety z brokera nie różnią się (z punktu widzenia flagi) od tych odebranych bezpośrednio przez radio.
+- Domyślnie `USERPREFS_CONFIG_LORA_IGNORE_MQTT` ustawione na `false` (węzeł nie ignoruje ruchu MQTT).
 
-- 🔧 **[Building Instructions](https://meshtastic.org/docs/development/firmware/build)** - Learn how to compile the firmware from source.
-- ⚡ **[Flashing Instructions](https://meshtastic.org/docs/getting-started/flashing-firmware/)** - Install or update the firmware on your device.
+#### 📍 Lokalizacja
+- **Zezwolenie na pełną precyzję pozycji** — `MAX_POSITION_PRECISION_PUBLIC_KEY` podniesione z 15 do 32 bitów, a zakres akceptowanej precyzji w raportach mapowych MQTT rozszerzony z 12–15 do 12–40. Dotyczy to zarówno kanału publicznego, jak i raportowania przez MQTT/mapę.
+- Domyślna precyzja pozycji w Traffic Management (`default_traffic_mgmt_position_precision_bits`) podniesiona z 19 do 32 bitów.
 
-Join our community and help improve Meshtastic! 🚀
+#### 💬 Komendy czatu i odpowiedzi automatyczne
+- **ReplyBot włączony** (`MESHTASTIC_EXCLUDE_REPLYBOT` z 1 na 0) z osobnymi, spersonalizowanymi odpowiedziami dla trzech komend:
+  - `/ping` — odpowiedź "pong!" wraz z diagnostyką (liczba skoków, RSSI, SNR)
+  - `/test` — odpowiedź po polsku z odnośnikiem do komendy "scyzoryk pomoc", bez diagnostyki sygnału
+  - `/hello` — powitanie w języku polskim z linkiem do mt-sw.pl, bez diagnostyki sygnału
+- **Nowy moduł `SignalReplyModule`** — odpowiada na wiadomość `!!Test!!`/`!!test!!` informacją o liczbie przeskoków (dla wiadomości pośrednich) albo RSSI/SNR (dla wiadomości bezpośrednich).
+- Remote Hardware moduł włączony (`MESHTASTIC_EXCLUDE_REMOTEHARDWARE` z 1 na 0).
 
-## Stats
+#### 📡 Sieć mesh
+- **NeighborInfo może być rozsyłane na kanale publicznym** — usunięto ograniczenie w `NeighborInfoModule.cpp`, które normalnie blokowało transmisję sąsiedztwa poza kanałem/slotem domyślnym.
+- **Poprawka przekazywania informacji o węźle-przekaźniku (`relay_node`)** — w `RadioLibInterface.cpp` i `ReliableRouter.cpp`: wcześniej `relay_node` był odrzucany przy `hop_start == 0`, co gubiło informację o przekaźniku dla wielu pakietów ACK (w tym implicit ACK). Teraz `relay_node` jest zawsze ufany bezpośrednio, a implicit ACK przekazuje go dalej do PhoneAPI/aplikacji — dzięki temu apka wie, który węzeł przekazał wysłaną wiadomość.
+- Skrócone limity częstotliwości żądań traceroute z 30 do 10 sekund (komunikat o limicie przetłumaczony na polski).
+- `HOP_RELIABLE` (domyślna liczba skoków dla niezawodnych wiadomości) podniesione z 3 do 7.
+- Dodano eksperymentalny fallback dekodowania dla UDP multicast (`HAS_UDP_MULTICAST`), próbujący domyślnych presetów/PSK gdy standardowe dopasowanie kanału zawiedzie.
 
-![Alt](https://repobeats.axiom.co/api/embed/8025e56c482ec63541593cc5bd322c19d5c0bdcf.svg "Repobeats analytics image")
+#### 🔋 Zasilanie i stabilność
+- **Auto-restart** — nowy wątek `AutoRebootThread`, domyślnie restartuje urządzenie co 30 dni pracy (konfigurowalne przez `AUTO_REBOOT_INTERVAL_SECS` w `platformio.ini`, maksymalnie ~49 dni ze względu na przewijanie licznika `millis()`).
+- **Moduł testu watchdoga** (`WatchdogTestThread`, domyślnie wyłączony) — pozwala celowo zawiesić firmware na określony czas, by zweryfikować że sprzętowy watchdog rzeczywiście resetuje urządzenie i zmierzyć jak długo to trwa. Włączany flagą kompilacji `WATCHDOG_TEST_ENABLED=1`.
+- Krzywa napięcia baterii (`OCV_ARRAY`) dostrojona do rzeczywistych ogniw używanych w projekcie.
+- Tryb parowania Bluetooth ustawiony na stały PIN (`FIXED_PIN`) również dla urządzeń z ekranem (wcześniej: losowy PIN dla urządzeń z ekranem).
+
+#### 🔌 Nowe warianty sprzętowe
+- **`rak_killer_v2`** — SuperMini nRF52840 + moduł Heltec HT-RA62 na dedykowanej płytce DIY.
+- **`ikoka_s3_e22`** i **`ikoka_s3_e22p`** — warianty na bazie Seeed XIAO S3, obsługujące moduły radiowe eByte E22-900M30S/E22-433M30S oraz E22P-868M30S.
+
+### Budowanie
+
+Standardowo przez PlatformIO:
+```bash
+pio run -e <nazwa-środowiska>
+```
+np. `pio run -e rak_killer_v2` albo `pio run -e ikoka_s3_e22`. Pełna lista środowisk w `platformio.ini` oraz w folderach `variants/`.
+
+---
+
+## 🇬🇧 English
+
+### About this fork
+
+This is a modified version of the official Meshtastic firmware, tailored for the Świętokrzyskie (MT_SW) regional mesh network. Changes include extended telemetry, MQTT privacy fixes, additional chat commands, new hardware variants, and several stability fixes.
+
+### What this fork changes vs. official Meshtastic
+
+#### 📊 Telemetry & stats
+- **`local_stats` broadcast over the mesh** — sent automatically right after standard device telemetry, on the same interval (e.g. every 2 hours as configured in `userPrefs.jsonc`, plus natural compensation depending on mesh traffic). In stock firmware, `local_stats` only goes to the phone, never over the mesh.
+- **New `local_stats_extended` telemetry packet** — sent right after `local_stats`, carrying CPU usage (%), flash usage (used/total), and RAM/PSRAM (free/total). CPU usage is computed from a custom busy-time counter around the main loop (`startBusy()`/`endBusy()` in `main.cpp`), averaged over the last 60 seconds.
+- **Telemetry intervals are no longer coerced to a role-aware minimum** — the mechanism in `NodeDB.cpp` that normally rounded configured telemetry intervals up to a role-based minimum on the default channel has been disabled. This allows e.g. a 2h device-telemetry interval to actually take effect instead of being overridden.
+- Default telemetry intervals raised: device telemetry to 2h, environment telemetry to 1h, position broadcast to 12h (configurable in `userPrefs.jsonc`).
+- Offline transmit-history record capacity doubled on larger flash chips (e.g. 250→500 for ≥15MB flash).
+
+#### 🔒 Privacy & MQTT
+- **Direct messages (DMs) never reach MQTT** — a guard added in `Router.cpp`/`MQTT.cpp` rejects any non-broadcast packet before it can be uplinked to the broker, regardless of channel uplink settings. Without this, a DM decrypted locally by a gateway node could be republished to the broker in plaintext.
+- **Packets relayed through MQTT are no longer flagged as `via_mqtt`** — `p->via_mqtt` changed from `true` to `false` in `MQTT.cpp`, so MQTT-sourced packets are indistinguishable (by that flag) from ones received directly over radio.
+- `USERPREFS_CONFIG_LORA_IGNORE_MQTT` defaults to `false` (the node does not ignore MQTT traffic).
+
+#### 📍 Location
+- **Full position precision allowed** — `MAX_POSITION_PRECISION_PUBLIC_KEY` raised from 15 to 32 bits, and the accepted precision range for MQTT map reports extended from 12–15 to 12–40. This applies to both the public channel and MQTT/map reporting.
+- Default Traffic Management position precision (`default_traffic_mgmt_position_precision_bits`) raised from 19 to 32 bits.
+
+#### 💬 Chat commands & auto-replies
+- **ReplyBot enabled** (`MESHTASTIC_EXCLUDE_REPLYBOT` flipped from 1 to 0) with distinct, localized replies for three commands:
+  - `/ping` — "pong!" plus signal diagnostics (hop count, RSSI, SNR)
+  - `/test` — a Polish-language reply pointing to the "scyzoryk pomoc" command, no diagnostics
+  - `/hello` — a Polish welcome message linking to mt-sw.pl, no diagnostics
+- **New `SignalReplyModule`** — replies to a `!!Test!!`/`!!test!!` message with either the hop count (for relayed messages) or RSSI/SNR (for direct messages).
+- Remote Hardware module enabled (`MESHTASTIC_EXCLUDE_REMOTEHARDWARE` flipped from 1 to 0).
+
+#### 📡 Mesh networking
+- **NeighborInfo can be broadcast on the public channel** — removed the restriction in `NeighborInfoModule.cpp` that normally blocked neighbor-info transmission outside the default channel/frequency slot.
+- **Relay-node (`relay_node`) propagation fix** — in `RadioLibInterface.cpp` and `ReliableRouter.cpp`: `relay_node` used to be discarded whenever `hop_start == 0`, silently dropping relay info on many ACK packets (including implicit ACKs). It's now always trusted directly, and the implicit ACK forwards it on to PhoneAPI/the app — so the app can show which node relayed a message you sent.
+- Traceroute request rate limit shortened from 30 to 10 seconds (rate-limit notification translated to Polish).
+- `HOP_RELIABLE` (default hop count for reliable messages) raised from 3 to 7.
+- Added an experimental UDP multicast decode fallback (`HAS_UDP_MULTICAST`) that tries default presets/PSK when normal channel matching fails.
+
+#### 🔋 Power & stability
+- **Auto-reboot** — new `AutoRebootThread`, reboots the device every 30 days of uptime by default (configurable via `AUTO_REBOOT_INTERVAL_SECS` in `platformio.ini`, capped at ~49 days due to `millis()` rollover).
+- **Watchdog test module** (`WatchdogTestThread`, disabled by default) — deliberately hangs the firmware for a set duration to verify the hardware watchdog actually resets the device and measure how long that takes. Enabled via the `WATCHDOG_TEST_ENABLED=1` build flag.
+- Battery voltage curve (`OCV_ARRAY`) tuned for the actual cells used in the project.
+- Bluetooth pairing mode set to a fixed PIN for screened devices too (previously: random PIN on devices with a screen).
+
+#### 🔌 New hardware variants
+- **`rak_killer_v2`** — SuperMini nRF52840 + Heltec HT-RA62 module on a dedicated DIY breakout board.
+- **`ikoka_s3_e22`** and **`ikoka_s3_e22p`** — Seeed XIAO S3-based variants supporting the eByte E22-900M30S/E22-433M30S and E22P-868M30S radio modules respectively.
+
+### Building
+
+Standard PlatformIO build:
+```bash
+pio run -e <environment-name>
+```
+e.g. `pio run -e rak_killer_v2` or `pio run -e ikoka_s3_e22`. Full list of environments in `platformio.ini` and under `variants/`.
