@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="https://github.com/MT-SW/MT_SW_FIRMWARE/raw/develop/.github/meshtastic_logo.png" width="120" alt="MT_SW" />
-</p>
+<img src="https://raw.githubusercontent.com/MT-SW/MT_SW_INTEGRATION/main/custom_components/meshtastic/brand/icon.png" width="40" alt="MT_SW" />
 
 # MT_SW Firmware
 
