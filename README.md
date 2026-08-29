@@ -1,4 +1,6 @@
-<img src="https://raw.githubusercontent.com/MT-SW/MT_SW_INTEGRATION/main/custom_components/meshtastic/brand/icon.png" width="40" alt="MT_SW" />
+<p align="center">
+  <img src="https://raw.githubusercontent.com/MT-SW/MT_SW_INTEGRATION/main/custom_components/meshtastic/brand/icon.png" width="140" alt="MT_SW" />
+</p>
 
 # MT_SW Firmware
 
@@ -56,6 +58,10 @@ To zmodyfikowana wersja oficjalnego firmware'u Meshtastic, dostosowana do potrze
 #### 🔌 Nowe warianty sprzętowe
 - **`rak_killer_v2`** — SuperMini nRF52840 + moduł Heltec HT-RA62 na dedykowanej płytce DIY.
 - **`ikoka_s3_e22`** i **`ikoka_s3_e22p`** — warianty na bazie Seeed XIAO S3, obsługujące moduły radiowe eByte E22-900M30S/E22-433M30S oraz E22P-868M30S.
+
+### Autorzy
+- **Spontaniczne Majsterkowanie** — integracja z siecią MT_SW, konfiguracja regionalna, dokumentacja
+- **cheaterenator** — rozwój customowego firmware (ReplyBot, telemetria rozszerzona, poprawki relay_node/MQTT, nowe warianty sprzętowe)
 
 ### Budowanie
 
@@ -115,6 +121,10 @@ This is a modified version of the official Meshtastic firmware, tailored for the
 #### 🔌 New hardware variants
 - **`rak_killer_v2`** — SuperMini nRF52840 + Heltec HT-RA62 module on a dedicated DIY breakout board.
 - **`ikoka_s3_e22`** and **`ikoka_s3_e22p`** — Seeed XIAO S3-based variants supporting the eByte E22-900M30S/E22-433M30S and E22P-868M30S radio modules respectively.
+
+### Credits
+- **Spontaniczne Majsterkowanie** — MT_SW network integration, regional configuration, documentation
+- **cheaterenator** — custom firmware development (ReplyBot, extended telemetry, relay_node/MQTT fixes, new hardware variants)
 
 ### Building
 
