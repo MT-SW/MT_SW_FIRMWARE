@@ -2,13 +2,27 @@
 // variant defines mesh-pb-constants.h needs (portduino resolves MAX_NUM_NODES at runtime).
 #include "configuration.h"
 
+#include "NodeDB.h"
 #include "ServerAPI.h"
 #include "Throttle.h"
+#include "concurrency/LockGuard.h"
+#include "memGet.h"
 #include <Arduino.h>
 #include <cstdlib>
 #include <new>
 
+#ifdef ARCH_ESP32
+#include <sys/select.h>
+#endif
+
 static constexpr uint32_t TCP_IDLE_TIMEOUT_MS = 15 * 60 * 1000UL;
+
+#ifdef ARCH_ESP32
+// lwIP and the Wi-Fi driver buffer from this heap too; a session that starves them leaves Wi-Fi deaf until TCP gives up.
+#ifndef API_CONNECTION_HEAP_HEADROOM
+#define API_CONNECTION_HEAP_HEADROOM (16 * 1024)
+#endif
+#endif
 
 template <typename T>
 ServerAPI<T>::ServerAPI(T &_client) : StreamAPI(&client), concurrency::OSThread("ServerAPI"), client(_client)
@@ -18,6 +32,9 @@ ServerAPI<T>::ServerAPI(T &_client) : StreamAPI(&client), concurrency::OSThread(
 
 template <typename T> ServerAPI<T>::~ServerAPI()
 {
+    // Detach from the log path before the queue and encode buffers it writes into go away.
+    if (logQueue.isActive())
+        console->setLogRecordSink(nullptr);
     client.stop();
 }
 
@@ -34,12 +51,18 @@ template <typename T> bool ServerAPI<T>::checkIsConnected()
     return client.connected();
 }
 
-template <typename T> bool ServerAPI<T>::canWriteFrame(size_t)
+/// Frame TCP output, retaining any tail the socket could not take yet.
+template <typename T> bool ServerAPI<T>::writeFrame(uint8_t *buf, size_t len, bool bestEffort)
 {
-    // Only a dropped link is a reason to refuse a write up front. A full transmit
-    // buffer (availableForWrite() == 0) is normal backpressure, not a dead socket,
-    // so we must not close the connection on it. A genuinely failed write is
-    // detected after the fact in onFrameWriteFailed().
+    if (len == 0 || !canWrite)
+        return false;
+
+    const size_t totalLen = buildFrameHeader(buf, len);
+
+    concurrency::LockGuard guard(&streamLock);
+    // Only a dropped link is a reason to refuse a write. A short write means the transmit buffer
+    // is momentarily full, so retain the tail and finish it on a later pass instead of tearing
+    // down the session mid-NodeDB-dump.
     if (!client.connected()) {
         canWrite = false;
         enabled = false;
@@ -48,15 +71,92 @@ template <typename T> bool ServerAPI<T>::canWriteFrame(size_t)
         return false;
     }
 
-    return true;
+    return frameWriter.writeFrame(client, buf, totalLen, bestEffort);
 }
 
-template <typename T> void ServerAPI<T>::onFrameWriteFailed(size_t frameLen, size_t writtenLen)
+/// Continue retained TCP output under the shared stream lock.
+template <typename T> bool ServerAPI<T>::finishPendingFrame()
 {
-    canWrite = false;
-    enabled = false;
-    LOG_WARN("TCP client write short (%lu/%lu bytes), closing API service", (unsigned long)writtenLen, (unsigned long)frameLen);
-    close();
+    concurrency::LockGuard guard(&streamLock);
+    return frameWriter.finishPendingFrame(client);
+}
+
+/// Report a retained TCP frame awaiting transmit space.
+template <typename T> bool ServerAPI<T>::hasRetainedFrame()
+{
+    concurrency::LockGuard guard(&streamLock);
+    return !frameWriter.isIdle();
+}
+
+/// Protect the retained log buffer from being re-encoded under it.
+template <typename T> bool ServerAPI<T>::canEncodeLogRecord()
+{
+    return !hasRetainedFrame();
+}
+
+template <typename T> bool ServerAPI<T>::canWriteFrame(size_t frameLen)
+{
+#ifdef ARCH_ESP32
+    // NetworkClient reports no write space and its write() waits seconds on a full socket, so ask lwIP.
+    // lwIP calls a socket writable only with more than 2 MSS of send buffer free, room for any frame.
+    (void)frameLen;
+    const int fd = client.fd();
+    if (fd < 0)
+        return false;
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(fd, &writeSet);
+    timeval noWait = {0, 0};
+    return select(fd + 1, nullptr, &writeSet, nullptr, &noWait) > 0;
+#else
+    return client.availableForWrite() >= (int)frameLen;
+#endif
+}
+
+/// Encode and queue one log line. Called inside RedirectablePrint::log(), whose mutex serializes callers,
+/// so nothing here may log or take streamLock.
+template <typename T>
+void ServerAPI<T>::onLogRecord(meshtastic_LogRecord_Level level, const char *source, const char *format, va_list arg)
+{
+    size_t len;
+    const uint8_t *payload = encodeLogRecord(level, source, format, arg, len);
+    if (len > 0)
+        logQueue.push(payload, len);
+}
+
+template <typename T> void ServerAPI<T>::updateLogQueue()
+{
+    if (API_LOG_QUEUE_SIZE == 0)
+        return;
+
+    const bool wanted = config.security.debug_log_api_enabled;
+    if (!wanted) {
+        logQueueRefused = false;
+        if (logQueue.isActive()) {
+            console->setLogRecordSink(nullptr);
+            logQueue.end();
+        }
+        return;
+    }
+    if (logQueue.isActive() || logQueueRefused)
+        return;
+
+#ifdef ARCH_ESP32
+    const uint32_t freeHeap = memGet.getFreeHeap();
+    if (freeHeap < API_LOG_QUEUE_SIZE + API_CONNECTION_HEAP_HEADROOM) {
+        LOG_WARN("Low heap for TCP debug log (%u free, %u needed), not sending it", (unsigned)freeHeap,
+                 (unsigned)(API_LOG_QUEUE_SIZE + API_CONNECTION_HEAP_HEADROOM));
+        logQueueRefused = true;
+        return;
+    }
+#endif
+    if (!logQueue.begin(API_LOG_QUEUE_SIZE)) {
+        LOG_WARN("No heap for TCP debug log queue (%u bytes), not sending it", (unsigned)API_LOG_QUEUE_SIZE);
+        logQueueRefused = true;
+        return;
+    }
+    console->setLogRecordSink(this);
+    LOG_INFO("Send debug log to TCP client (%u-byte queue)", (unsigned)API_LOG_QUEUE_SIZE);
 }
 
 template <class T> int32_t ServerAPI<T>::runOnce()
@@ -68,7 +168,18 @@ template <class T> int32_t ServerAPI<T>::runOnce()
             enabled = false;
             return 0;
         }
-        return StreamAPI::runOncePart();
+        int32_t delay = StreamAPI::runOncePart();
+
+        updateLogQueue();
+        drainLogRecords(logQueue);
+        // Report a gap only once the backlog clears, so a stalled client does not turn this into a log flood.
+        if (logQueue.isEmpty()) {
+            if (uint32_t dropped = logQueue.takeDropped())
+                LOG_WARN("TCP debug log dropped %u records", (unsigned)dropped);
+        }
+
+        // Nothing wakes us when the socket frees transmit space.
+        return (hasPendingOutput() || !logQueue.isEmpty()) && delay > 25 ? 25 : delay;
     } else {
         LOG_INFO("Client dropped connection, suspend API service");
         close();
@@ -118,6 +229,16 @@ template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
             LOG_INFO("Force close previous TCP connection");
             openAPI.reset();
         }
+
+#ifdef ARCH_ESP32
+        const uint32_t freeHeap = memGet.getFreeHeap();
+        if (freeHeap < sizeof(T) + API_CONNECTION_HEAP_HEADROOM) {
+            LOG_WARN("Low heap for API connection (%u free, %u needed), dropping client", (unsigned)freeHeap,
+                     (unsigned)(sizeof(T) + API_CONNECTION_HEAP_HEADROOM));
+            client.stop();
+            return 100;
+        }
+#endif
 
         // A ServerAPI carries the stream rx/tx buffers plus the FromRadio/ToRadio scratch, several
         // KB in one block. On ESP32 a new that cannot get that block is a reboot (see the note on

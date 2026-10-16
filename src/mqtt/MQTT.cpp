@@ -3,10 +3,12 @@
 #include "NodeDB.h"
 #include "PowerFSM.h"
 #include "ServiceEnvelope.h"
+#include "UptimeClock.h"
 #include "configuration.h"
 #include "main.h"
 #include "mesh/Channels.h"
 #include "mesh/CryptoEngine.h"
+#include "mesh/PositionPrecision.h"
 #include "mesh/Router.h"
 #include "mesh/generated/meshtastic/mqtt.pb.h"
 #include "mesh/generated/meshtastic/telemetry.pb.h"
@@ -152,7 +154,7 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
     p->hop_limit = e.packet->hop_limit;
     p->hop_start = e.packet->hop_start;
     p->want_ack = e.packet->want_ack;
-    p->via_mqtt = false;       // Mark that the packet was received via MQTT
+    p->via_mqtt = true;       // Mark that the packet was received via MQTT
     p->pki_encrypted = false; // Only local AES-CCM decryption may establish PKI authentication.
     p->transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
     p->which_payload_variant = e.packet->which_payload_variant;
@@ -243,9 +245,22 @@ bool isDefaultServer(const String &host)
     return host.length() == 0 || host == default_mqtt_address;
 }
 
+// "msh/<region>" is what the default broker's convention produces; any other suffix is the user's own.
+bool isRegionRootTopic(const char *root)
+{
+    const size_t prefixLen = strlen(default_mqtt_root) + 1;
+    if (strncmp(root, default_mqtt_root "/", prefixLen) != 0)
+        return false;
+    for (const RegionInfo *r = regions; r->code != meshtastic_Config_LoRaConfig_RegionCode_UNSET; r++)
+        if (strcmp(r->name, root + prefixLen) == 0)
+            return true;
+    return false;
+}
+
+// The regional roots count as default: they are what a region change writes on the default broker.
 bool isDefaultRootTopic(const String &root)
 {
-    return root.length() == 0 || root == default_mqtt_root;
+    return root.length() == 0 || root == default_mqtt_root || isRegionRootTopic(root.c_str());
 }
 
 struct PubSubConfig {
@@ -362,12 +377,42 @@ void MQTT::onReceive(char *topic, byte *payload, size_t length)
     onReceiveProto(topic, payload, length);
 }
 
+bool MQTT::applyRegionRootTopic(const char *regionName)
+{
+    // The region suffix is a convention of the default broker; a regional broker is regional already.
+    auto [host, parsedPort] = parseHostAndPort(moduleConfig.mqtt.address);
+    (void)parsedPort;
+    if (!isDefaultServer(host))
+        return false;
+    if (!isDefaultRootTopic(moduleConfig.mqtt.root))
+        return false; // the user picked their own root
+    snprintf(moduleConfig.mqtt.root, sizeof(moduleConfig.mqtt.root), "%s/%s", default_mqtt_root, regionName);
+    return true;
+}
+
 void mqttInit()
 {
     if (!moduleConfig.mqtt.enabled)
         return;
 
     new MQTT();
+}
+
+void MQTT::reinitTopics()
+{
+    topicRoot = moduleConfig.mqtt.root;
+    const std::string root = *moduleConfig.mqtt.root ? moduleConfig.mqtt.root : default_mqtt_root;
+    cryptTopic = root + "/2/e/";
+    mapTopic = root + "/2/map/";
+    isConfiguredForDefaultRootTopic = isDefaultRootTopic(moduleConfig.mqtt.root);
+
+#if HAS_NETWORKING
+    // Force a broker reconnect so subscriptions are refreshed with the new topic prefix
+    if (pubSub.connected()) {
+        pubSub.disconnect();
+    }
+    isConnected = false;
+#endif
 }
 
 #if HAS_NETWORKING
@@ -384,15 +429,7 @@ MQTT::MQTT() : concurrency::OSThread("mqtt"), mqttQueue(MAX_MQTT_QUEUE)
         assert(!mqtt);
         mqtt = this;
 
-        if (*moduleConfig.mqtt.root) {
-            cryptTopic = moduleConfig.mqtt.root + cryptTopic;
-            mapTopic = moduleConfig.mqtt.root + mapTopic;
-            isConfiguredForDefaultRootTopic = isDefaultRootTopic(moduleConfig.mqtt.root);
-        } else {
-            cryptTopic = "msh" + cryptTopic;
-            mapTopic = "msh" + mapTopic;
-            isConfiguredForDefaultRootTopic = true;
-        }
+        reinitTopics();
 
         if (moduleConfig.mqtt.map_reporting_enabled && moduleConfig.mqtt.has_map_report_settings) {
             map_position_precision = Default::getConfiguredOrDefault(moduleConfig.mqtt.map_report_settings.position_precision,
@@ -568,6 +605,9 @@ int32_t MQTT::runOnce()
 {
     if (!moduleConfig.mqtt.enabled || !(moduleConfig.mqtt.map_reporting_enabled || channels.anyMqttEnabled()))
         return disable();
+    // A region change rewrites the root at runtime, from several call sites
+    if (topicRoot != moduleConfig.mqtt.root)
+        reinitTopics();
     bool wantConnection = wantsLink();
 
     perhapsReportToMap();
@@ -706,7 +746,7 @@ void MQTT::onSend(const meshtastic_MeshPacket &mp_encrypted, const meshtastic_Me
         return;
     }
 #endif
-    // Never uplink a packet addressed to a specific node (a DM) to MQTT, regardless of channel
+// Never uplink a packet addressed to a specific node (a DM) to MQTT, regardless of channel
     // uplink settings or PKI status. Only broadcasts (telemetry, position, public channel chat)
     // should ever reach the broker. Without this, a DM sent TO us - which we've already decrypted
     // locally to show on screen - gets republished in plaintext the moment our node acts as gateway.
@@ -727,6 +767,11 @@ void MQTT::onSend(const meshtastic_MeshPacket &mp_encrypted, const meshtastic_Me
     if (mp_decoded.which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
         // For uplinking other's packets, check if it's not OK to MQTT or if it's an older packet without the bitfield
         bool dontUplink = !mp_decoded.decoded.has_bitfield || !(mp_decoded.decoded.bitfield & BITFIELD_OK_TO_MQTT_MASK);
+#if USERPREFS_TRANSGRESS_OK_TO_MQTT
+        // Disregard the sender's OK_TO_MQTT flag, except on the default server
+        if (!isConfiguredForDefaultServer)
+            dontUplink = false;
+#endif
         // Respect the DontMqttMeBro flag for other nodes' packets on public MQTT servers
         if (!isFromUs(&mp_decoded) && !isMqttServerAddressPrivate && dontUplink) {
             LOG_INFO("MQTT onSend - drop packet: DontMqttMeBro flag");
@@ -748,11 +793,16 @@ void MQTT::onSend(const meshtastic_MeshPacket &mp_encrypted, const meshtastic_Me
 
     LOG_DEBUG("MQTT onSend - Publish ");
     const meshtastic_MeshPacket *p;
+    meshtastic_MeshPacket *coerced = nullptr;
     if (moduleConfig.mqtt.encryption_enabled) {
         p = &mp_encrypted;
         LOG_DEBUG("encrypted message");
     } else if (mp_decoded.which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
         p = &mp_decoded;
+        // A signed payload is published as sent: a coerced copy would no longer verify at downlink gateways.
+        if (mp_decoded.decoded.portnum == meshtastic_PortNum_NODEINFO_APP && mp_decoded.decoded.xeddsa_signature.size == 0 &&
+            (coerced = packetPool.allocCopy(mp_decoded, 0)) && coerceNodeInfoUserId(*coerced))
+            p = coerced;
         LOG_DEBUG("portnum %i message", mp_decoded.decoded.portnum);
     } else {
         LOG_DEBUG("nothing, pkt not decrypted");
@@ -766,6 +816,10 @@ void MQTT::onSend(const meshtastic_MeshPacket &mp_encrypted, const meshtastic_Me
                                             .channel_id = const_cast<char *>(channelId),
                                             .gateway_id = const_cast<char *>(nodeId.c_str())};
     size_t numBytes = pb_encode_to_bytes(bytes, sizeof(bytes), &meshtastic_ServiceEnvelope_msg, &env);
+    if (coerced)
+        packetPool.release(coerced);
+    if (topicRoot != moduleConfig.mqtt.root)
+        reinitTopics(); // root changed before runOnce() noticed
     std::string topic = cryptTopic + channelId + "/" + nodeId;
 
     if (moduleConfig.mqtt.proxy_to_client_enabled || this->isConnectedDirectly()) {
@@ -803,10 +857,14 @@ void MQTT::perhapsReportToMap()
 
     // Coerce the map position precision to be within the valid range
     // This removes obtusely large radius and privacy problematic ones from the map
-    if (map_position_precision < 12 || map_position_precision > 40) {
-        LOG_WARN("MQTT Map report position precision %u is out of range, using default %u", map_position_precision,
+    if (map_position_precision < 12) {
+        LOG_WARN("MQTT Map report position precision %u out of range, use default %u", map_position_precision,
                  default_map_position_precision);
         map_position_precision = default_map_position_precision;
+    } else if (map_position_precision > 32) {
+        // A coordinate has only 32 bits; anything above means full precision
+        LOG_WARN("MQTT Map report position precision %u out of range, use 32", map_position_precision);
+        map_position_precision = 32;
     }
 
     if (Throttle::isWithinTimespanMs(last_report_to_map, map_publish_interval_msecs) && last_report_to_map != 0)
@@ -843,11 +901,10 @@ void MQTT::perhapsReportToMap()
     mapReport.has_default_channel = channels.hasDefaultChannel();
     mapReport.has_opted_report_location = true;
 
-    // Set position with precision (same as in PositionModule)
-    mapReport.latitude_i = localPosition.latitude_i & (UINT32_MAX << (32 - map_position_precision));
-    mapReport.longitude_i = localPosition.longitude_i & (UINT32_MAX << (32 - map_position_precision));
-    mapReport.latitude_i += (1 << (31 - map_position_precision));
-    mapReport.longitude_i += (1 << (31 - map_position_precision));
+    // Set position with precision (same as in PositionModule). Precision 32 is passed through unchanged:
+    // the half-cell offset there would be 1 << -1 (UB, 1 << 31 on ESP32) and flip the sign bit.
+    mapReport.latitude_i = truncateCoordinate(localPosition.latitude_i, map_position_precision);
+    mapReport.longitude_i = truncateCoordinate(localPosition.longitude_i, map_position_precision);
 
     mapReport.altitude = localPosition.altitude;
     mapReport.position_precision = map_position_precision;
@@ -875,5 +932,5 @@ void MQTT::perhapsReportToMap()
     packetPool.release(mp);
 
     // Update the last report time
-    last_report_to_map = millis();
+    last_report_to_map = Time::skipZero(Time::getMillis());
 }

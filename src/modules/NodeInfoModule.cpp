@@ -4,6 +4,7 @@
 #include "NodeDB.h"
 #include "NodeStatus.h"
 #include "Router.h"
+#include "RoutingModule.h"
 #include "TransmitHistory.h"
 #include "UptimeClock.h"
 #include "configuration.h"
@@ -12,13 +13,15 @@
 #include <Throttle.h>
 #include <algorithm>
 
-#ifndef USERPREFS_NODEINFO_REPLY_SUPPRESS_SECS
-#define USERPREFS_NODEINFO_REPLY_SUPPRESS_SECS (12 * 60 * 60)
-#endif
-
 NodeInfoModule *nodeInfoModule;
 
 static constexpr uint32_t NodeInfoReplySuppressSeconds = USERPREFS_NODEINFO_REPLY_SUPPRESS_SECS;
+
+// How long a client's NodeInfo request waits for any NodeInfo from its target before the fallback
+// fires, and how long after that another fallback to the same target is held off: the target answers
+// the fallback on its 60 s interactive gate, so a sooner one would only be ignored.
+static constexpr uint32_t NodeInfoRequestFallbackMs = 20 * 1000;
+static constexpr uint32_t NodeInfoRequestFallbackHoldMs = 60 * 1000;
 
 bool NodeInfoModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_User *pptr)
 {
@@ -31,18 +34,24 @@ bool NodeInfoModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mes
 
     auto p = *pptr;
 
-    // Suppress replies to senders we've replied to recently (12H window)
+    // Any NodeInfo from a remote a client is waiting on answers that request, whatever its shape.
+    for (auto &req : pendingRequests) {
+        if (req.target == getFrom(&mp))
+            req = {};
+    }
+
+    // Suppress replies to senders we answered recently (USERPREFS_NODEINFO_REPLY_SUPPRESS_SECS). The
+    // stamp is taken in allocReply() when a reply is actually built, so a request that goes unanswered
+    // - suppressed here, throttled, or refused on channel utilisation - does not move the window: a
+    // sender that keeps asking would otherwise never be answered at all.
     if (mp.decoded.want_response && !isFromUs(&mp)) {
-        const NodeNum sender = getFrom(&mp);
         // A local dedup window, not a wall-clock reading - uptime avoids RTC jumps and replayed
         // packets' stale rx_time perturbing it. Seconds, not millis - this is a wide window.
         const uint32_t nowSecs = Time::getUptimeSecs();
-        auto it = lastNodeInfoSeen.find(sender);
+        auto it = lastNodeInfoSeen.find(getFrom(&mp));
         if (it != lastNodeInfoSeen.end() && (uint32_t)(nowSecs - it->second) < NodeInfoReplySuppressSeconds) {
             suppressReplyForCurrentRequest = true;
         }
-        lastNodeInfoSeen[sender] = nowSecs;
-        pruneLastNodeInfoCache();
     }
 
     if (p.is_licensed != owner.is_licensed) {
@@ -85,25 +94,17 @@ bool NodeInfoModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mes
     return false; // Let others look at this message also if they want
 }
 
-void NodeInfoModule::alterReceivedProtobuf(meshtastic_MeshPacket &mp, meshtastic_User *p)
-{
-    // Coerce user.id to be derived from the node number
-    snprintf(p->id, sizeof(p->id), "!%08x", getFrom(&mp));
-
-    // Re-encode the altered protobuf back into the packet
-    mp.decoded.payload.size =
-        pb_encode_to_bytes(mp.decoded.payload.bytes, sizeof(mp.decoded.payload.bytes), &meshtastic_User_msg, p);
-}
-
-void NodeInfoModule::sendOurNodeInfo(NodeNum dest, bool wantReplies, uint8_t channel, bool _shorterTimeout)
+bool NodeInfoModule::sendOurNodeInfo(NodeNum dest, bool wantReplies, uint8_t channel, bool _shorterTimeout)
 {
     // cancel any not yet sent (now stale) position packets
     if (prevPacketId) // if we wrap around to zero, we'll simply fail to cancel in that rare case (no big deal)
         service->cancelSending(prevPacketId);
     shorterTimeout = _shorterTimeout;
+    deferHistoryStamp = true;
     DEBUG_HEAP_BEFORE;
     meshtastic_MeshPacket *p = allocReply();
     DEBUG_HEAP_AFTER("NodeInfoModule::sendOurNodeInfo", p);
+    deferHistoryStamp = false;
 
     if (p) { // Check whether we didn't ignore it
         p->to = dest;
@@ -123,15 +124,111 @@ void NodeInfoModule::sendOurNodeInfo(NodeNum dest, bool wantReplies, uint8_t cha
 
         prevPacketId = p->id;
 
-        service->sendToMesh(p);
+        const ErrorCode res = service->sendToMesh(p);
         shorterTimeout = false;
+        // A rejected send never reached the air, so it neither defers the routine broadcast nor
+        // consumes a pending channel change. sendToMesh() has already released the packet.
+        if (res != ERRNO_OK && res != ERRNO_SHOULD_RELEASE) {
+            LOG_WARN("NodeInfo send rejected (err=%d)", res);
+            return false;
+        }
+        if (transmitHistory)
+            transmitHistory->setLastSentToMesh(meshtastic_PortNum_NODEINFO_APP);
+        // Our NodeInfo just went on the air, so the routine broadcast is due a full interval from now
+        // rather than from the last tick - an ad-hoc send otherwise leaves the periodic copy right behind it.
+        setIntervalFromNow(
+            Default::getConfiguredOrDefaultMs(config.device.node_info_broadcast_secs, default_node_info_broadcast_secs));
+        return true;
     }
+    return false;
 }
 
 void NodeInfoModule::triggerImmediateNodeInfoCheck()
 {
     LOG_DEBUG("NodeInfo: scheduling immediate periodic check");
     setIntervalFromNow(0);
+}
+
+void NodeInfoModule::noteOutgoingNodeInfoRequest(const meshtastic_MeshPacket &p)
+{
+    if (p.which_payload_variant != meshtastic_MeshPacket_decoded_tag || p.decoded.portnum != meshtastic_PortNum_NODEINFO_APP ||
+        !p.decoded.want_response || p.to == 0 || isBroadcast(p.to) || p.to == nodeDB->getNodeNum())
+        return;
+
+    const uint32_t now = Time::getMillis();
+    PendingNodeInfoRequest *slot = nullptr;
+    for (auto &req : pendingRequests) {
+        if (req.target != p.to)
+            continue;
+        // Already waiting on this target, or its fallback went out too recently to be answered again.
+        if (!req.fallbackSent || Throttle::isWithinTimespanMs(req.sentMs, NodeInfoRequestFallbackHoldMs))
+            return;
+        slot = &req;
+        break;
+    }
+    if (!slot) {
+        // New target: take a free entry, otherwise the one noted longest ago.
+        slot = &pendingRequests[0];
+        for (auto &req : pendingRequests) {
+            if (req.target == 0) {
+                slot = &req;
+                break;
+            }
+            if ((uint32_t)(now - req.sentMs) > (uint32_t)(now - slot->sentMs))
+                slot = &req;
+        }
+    }
+
+    slot->target = p.to;
+    slot->requestId = p.id;
+    slot->sentMs = Time::skipZero(now);
+    slot->channel = p.channel;
+    slot->hopLimit = p.hop_limit ? p.hop_limit : Default::getConfiguredOrDefaultHopLimit(config.lora.hop_limit);
+    slot->fallbackSent = false;
+
+    // The new entry has the full window, so the soonest deadline is whichever pending one is earlier.
+    uint32_t nextMs = NodeInfoRequestFallbackMs;
+    for (const auto &req : pendingRequests) {
+        if (req.target && !req.fallbackSent)
+            nextMs = std::min(nextMs, Throttle::remainingMs(req.sentMs, NodeInfoRequestFallbackMs));
+    }
+    requestFallbackTimer->setIntervalFromNow(nextMs);
+    requestFallbackTimer->enabled = true;
+}
+
+/**
+ * A NodeInfo request can go unanswered for reasons the requester cannot fix: the target's reply
+ * throttles (a 12 h per-requester window and a 30 minute floor on builds without our fixes) drop it
+ * silently. Every firmware since 2.5 answers PKI_UNKNOWN_PUBKEY with its NodeInfo at once, on the
+ * 60 s interactive gate and outside those throttles, so send that when no NodeInfo from the target
+ * has arrived in time. It repurposes the error: the target logs a PKI decrypt failure that did not
+ * happen. The NodeInfo it sends carries no request_id, so clients see a node update rather than an
+ * answered request.
+ */
+int32_t NodeInfoModule::runRequestFallback()
+{
+    uint32_t nextMs = 0;
+    for (auto &req : pendingRequests) {
+        if (!req.target || req.fallbackSent)
+            continue;
+        const uint32_t remaining = Throttle::remainingMs(req.sentMs, NodeInfoRequestFallbackMs);
+        if (remaining) {
+            nextMs = nextMs ? std::min(nextMs, remaining) : remaining;
+            continue;
+        }
+        if (!routingModule || (airTime && !airTime->isTxAllowedChannelUtil(true))) {
+            LOG_DEBUG("NodeInfo request to 0x%08x unanswered, channel too busy for the fallback", req.target);
+            req = {};
+            continue;
+        }
+        LOG_INFO("No NodeInfo from 0x%08x %us after the client's request; prompt it with PKI_UNKNOWN_PUBKEY", req.target,
+                 (unsigned)(NodeInfoRequestFallbackMs / 1000));
+        routingModule->sendAckNak(meshtastic_Routing_Error_PKI_UNKNOWN_PUBKEY, req.target, req.requestId, req.channel,
+                                  req.hopLimit);
+        req.fallbackSent = true;
+        req.sentMs = Time::skipZero(Time::getMillis());
+    }
+    return nextMs ? (int32_t)nextMs : requestFallbackTimer->disable();
 }
 
 meshtastic_MeshPacket *NodeInfoModule::allocReply()
@@ -143,7 +240,7 @@ meshtastic_MeshPacket *NodeInfoModule::allocReply()
                                              currentRequest->decoded.want_response && !isFromUs(currentRequest);
 
     if (suppressReplyForCurrentRequest && isReplyingToExternalRequest) {
-        LOG_DEBUG("Skip send NodeInfo since we heard the requester <12h ago");
+        LOG_DEBUG("Skip send NodeInfo since we answered the requester <%us ago", (unsigned)NodeInfoReplySuppressSeconds);
         ignoreRequest = true;
         suppressReplyForCurrentRequest = false;
         return NULL;
@@ -155,14 +252,27 @@ meshtastic_MeshPacket *NodeInfoModule::allocReply()
         return NULL;
     }
 
-    // Use graduated scaling based on active mesh size (10 minute base, scales with congestion coefficient)
-    uint32_t timeoutMs = Default::getConfiguredOrDefaultMsScaled(0, 10 * 60, nodeStatus->getNumOnline());
+    // Use graduated scaling based on active mesh size (30 minute base, scales with congestion coefficient)
+    uint32_t timeoutMs = Default::getConfiguredOrDefaultMsScaled(0, 30 * 60, nodeStatus->getNumOnline());
+    // A licensed station's call-sign announcement is a regulatory interval, not a preference: ham mode
+    // sets node_info_broadcast_secs to 600 s, which a set-config would otherwise clamp to an hour.
+    // Never hold such a station past its own interval, whatever the floor and the scaling say.
+    if (owner.is_licensed) {
+        const uint32_t hamMs =
+            Default::getConfiguredOrDefaultMs(config.device.node_info_broadcast_secs, default_node_info_broadcast_secs);
+        if (hamMs < timeoutMs)
+            timeoutMs = hamMs;
+    }
     uint32_t lastNodeInfo = transmitHistory ? transmitHistory->getLastSentToMeshMillis(meshtastic_PortNum_NODEINFO_APP) : 0;
-    if (!shorterTimeout && lastNodeInfo && Throttle::isWithinTimespanMs(lastNodeInfo, timeoutMs)) {
+    // A request addressed to this node is someone asking for us right now, so it gets the interactive
+    // gate rather than the routine floor; the per-requester window above keeps any one sender from
+    // repeating it. A broadcast request reaches every neighbour at once and keeps the floor.
+    const bool interactive = shorterTimeout || (isReplyingToExternalRequest && isToUs(currentRequest));
+    if (!interactive && lastNodeInfo && Throttle::isWithinTimespanMs(lastNodeInfo, timeoutMs)) {
         LOG_DEBUG("Skip send NodeInfo since we sent it <%us ago", timeoutMs / 1000);
         ignoreRequest = true; // Mark it as ignored for MeshModule
         return NULL;
-    } else if (shorterTimeout && lastNodeInfo && Throttle::isWithinTimespanMs(lastNodeInfo, 60 * 1000)) {
+    } else if (interactive && lastNodeInfo && Throttle::isWithinTimespanMs(lastNodeInfo, 60 * 1000)) {
         // For interactive/urgent requests (e.g., user-triggered or implicit requests), use a shorter 60s timeout
         LOG_DEBUG("Skip send NodeInfo since we sent it <60s ago");
         ignoreRequest = true;
@@ -178,8 +288,16 @@ meshtastic_MeshPacket *NodeInfoModule::allocReply()
         strcpy(u.id, nodeDB->getNodeId().c_str());
 
         LOG_INFO("Send owner %s/%s/%s", u.id, u.long_name, u.short_name);
-        if (transmitHistory)
+        // The framework sends its own reply, so stamp here for that path. sendOurNodeInfo() stamps
+        // after the router accepts the packet instead - a send that never went out must not throttle
+        // the next one, and the floor it would sit out is 30 minutes.
+        if (transmitHistory && !deferHistoryStamp)
             transmitHistory->setLastSentToMesh(meshtastic_PortNum_NODEINFO_APP);
+        // Open the requester's suppression window only now that it is getting an answer.
+        if (isReplyingToExternalRequest) {
+            lastNodeInfoSeen[getFrom(currentRequest)] = Time::getUptimeSecs();
+            pruneLastNodeInfoCache();
+        }
         return allocDataProtobuf(u);
     }
 }
@@ -221,17 +339,20 @@ NodeInfoModule::NodeInfoModule()
 
     setIntervalFromNow(setStartDelay()); // Send our initial owner announcement 30 seconds
                                          // after we start (to give network time to setup)
+
+    // Idle until a client's NodeInfo request is noted.
+    requestFallbackTimer.reset(new concurrency::Periodic("NodeInfoFallback", [this]() { return runRequestFallback(); }));
+    requestFallbackTimer->disable();
 }
 
 int32_t NodeInfoModule::runOnce()
 {
-    // If we changed channels, ask everyone else for their latest info
-    bool requestReplies = currentGeneration != radioGeneration;
-    currentGeneration = radioGeneration;
-
     if (airTime->isTxAllowedAirUtil() && config.device.role != meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN) {
+        // If we changed channels, ask everyone else for their latest info
+        bool requestReplies = currentGeneration != radioGeneration;
         LOG_INFO("Send our nodeinfo to mesh (wantReplies=%d)", requestReplies);
-        sendOurNodeInfo(NODENUM_BROADCAST, requestReplies); // Send our info (don't request replies)
+        if (sendOurNodeInfo(NODENUM_BROADCAST, requestReplies))
+            currentGeneration = radioGeneration; // only a send that went out consumes the channel change
     }
     return Default::getConfiguredOrDefaultMs(config.device.node_info_broadcast_secs, default_node_info_broadcast_secs);
 }

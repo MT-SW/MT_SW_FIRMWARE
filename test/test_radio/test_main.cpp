@@ -2,13 +2,32 @@
 #include "MeshRadio.h"
 #include "MeshService.h"
 #include "RadioInterface.h"
+#include "RadioLibInterface.h"
 #include "TestUtil.h"
+#include "UptimeClock.h"
+#include "memory/MemAudit.h"
+#include <string.h>
 #include <unity.h>
 
 #include "meshtastic/config.pb.h"
 #include "support/MockMeshService.h"
+#include <memory>
 
 static MockMeshService *mockMeshService;
+
+// getTxDelayMsec() reads channel utilization off the airTime global, which is NULL by default.
+class ScopedAirTimeFixture
+{
+  public:
+    ScopedAirTimeFixture() : previous(airTime) { airTime = &instance; }
+    ~ScopedAirTimeFixture() { airTime = previous; }
+
+  private:
+    AirTime instance;
+    AirTime *previous;
+};
+
+static std::unique_ptr<ScopedAirTimeFixture> airTimeFixture;
 
 static void test_lr20x0BandClassification()
 {
@@ -16,6 +35,19 @@ static void test_lr20x0BandClassification()
     TEST_ASSERT_FALSE(isLr20x0HighBand(1500.0f));
     TEST_ASSERT_TRUE(isLr20x0HighBand(2400.0f));
     TEST_ASSERT_TRUE(isLr20x0HighBand(2420.71875f));
+}
+
+static void test_lr20x0CustomLfPaBandCoversOnly500To1000MHz()
+{
+    // The board LF PA table is the datasheet's 915 MHz design; 433 MHz and anything above 1 GHz keep RadioLib's.
+    TEST_ASSERT_FALSE(isLr20x0CustomLfPaBand(433.175f));
+    TEST_ASSERT_FALSE(isLr20x0CustomLfPaBand(499.9f));
+    TEST_ASSERT_TRUE(isLr20x0CustomLfPaBand(500.0f));
+    TEST_ASSERT_TRUE(isLr20x0CustomLfPaBand(869.525f));
+    TEST_ASSERT_TRUE(isLr20x0CustomLfPaBand(906.875f));
+    TEST_ASSERT_TRUE(isLr20x0CustomLfPaBand(1000.0f));
+    TEST_ASSERT_FALSE(isLr20x0CustomLfPaBand(1000.1f));
+    TEST_ASSERT_FALSE(isLr20x0CustomLfPaBand(2420.71875f));
 }
 
 static void test_lr20x0BandHopDetection()
@@ -59,6 +91,13 @@ class TestableRadioInterface : public RadioInterface
     uint8_t getCr() const { return cr; }
     uint8_t getSf() const { return sf; }
     float getBw() const { return bw; }
+
+    uint32_t getSlotTimeMsec() const { return slotTimeMsec; }
+    static constexpr uint8_t cwMax() { return CWmax; }
+
+    size_t beginSendingPublic(meshtastic_MeshPacket *p) { return beginSending(p); }
+    meshtastic_MeshPacket *getSendingPacket() const { return sendingPacket; }
+    void clearSendingPacketForTest() { sendingPacket = nullptr; }
 
     // Override reconfigure to call the base which invokes applyModemConfig()
     bool reconfigure() override { return RadioInterface::reconfigure(); }
@@ -298,7 +337,11 @@ static void test_regionPresetMap_coversAllRegionsWithinBounds()
     meshtastic_LoRaRegionPresetMap map;
     getRegionPresetMap(map);
 
+#ifdef USERPREFS_LORACONFIG_MODEM_PRESET
+    const size_t known = countKnownRegions() + 1; // + the UNSET intent entry
+#else
     const size_t known = countKnownRegions();
+#endif
     TEST_ASSERT_EQUAL_UINT((unsigned)known, (unsigned)map.region_groups_count);
 
     // Bounds derived from the generated nanopb arrays (mesh.options max_count), so
@@ -333,6 +376,12 @@ static void test_regionPresetMap_matchesRegionTable()
 
         const meshtastic_LoRaPresetGroup &grp = map.groups[gi];
         const RegionInfo *r = getRegion(code);
+
+#ifdef USERPREFS_LORACONFIG_MODEM_PRESET
+        // UNSET states the pinned preset, not PROFILE_UNDEF's list, so the table checks below don't apply.
+        if (code == meshtastic_Config_LoRaConfig_RegionCode_UNSET)
+            continue;
+#endif
 
         // Group's list is non-empty and within the generated array bound.
         const size_t maxPresets = sizeof(grp.presets) / sizeof(grp.presets[0]);
@@ -373,6 +422,361 @@ static void test_regionPresetMap_matchesRegionTable()
     }
 }
 
+// UNSET appears only when the build pins a preset, and then states exactly that preset.
+// A stock build leaves it out entirely, which clients read as "unconstrained".
+static void test_regionPresetMap_unsetCarriesUserprefsIntent()
+{
+    meshtastic_LoRaRegionPresetMap map;
+    getRegionPresetMap(map);
+
+    const meshtastic_LoRaPresetGroup *grp = nullptr;
+    for (pb_size_t i = 0; i < map.region_groups_count; i++)
+        if (map.region_groups[i].region == meshtastic_Config_LoRaConfig_RegionCode_UNSET)
+            grp = &map.groups[map.region_groups[i].group_index];
+
+#ifdef USERPREFS_LORACONFIG_MODEM_PRESET
+    const meshtastic_Config_LoRaConfig_ModemPreset pinned = USERPREFS_LORACONFIG_MODEM_PRESET;
+    TEST_ASSERT_NOT_NULL_MESSAGE(grp, "a build that pins a preset must state it for UNSET");
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1, (unsigned)grp->presets_count, "the pinned preset is the sole entry");
+    TEST_ASSERT_EQUAL(pinned, grp->presets[0]);
+    TEST_ASSERT_EQUAL(pinned, grp->default_preset);
+    TEST_ASSERT_FALSE_MESSAGE(grp->licensed_only, "UNSET is not a licensed-only region");
+
+    // Stating intent must not narrow what the device accepts: the firmware still takes any
+    // real preset while the region is unset (#11496), so the map cannot become enforcement.
+    const RegionInfo *unset = getRegion(meshtastic_Config_LoRaConfig_RegionCode_UNSET);
+    TEST_ASSERT_TRUE(unset->supportsPreset(meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST));
+    TEST_ASSERT_TRUE(unset->supportsPreset(meshtastic_Config_LoRaConfig_ModemPreset_SHORT_TURBO));
+#else
+    TEST_ASSERT_NULL_MESSAGE(grp, "a stock build must leave UNSET out of the map entirely");
+#endif
+}
+
+// In-flight packet bytes as packetPool reports them, 0 before the first alloc registers the tag.
+static int32_t packetPoolLiveBytes()
+{
+    memaudit::Tag rows[memaudit::kMaxTags];
+    size_t n = memaudit::snapshot(rows, memaudit::kMaxTags);
+    for (size_t i = 0; i < n; i++)
+        if (rows[i].tag && strcmp(rows[i].tag, "pktpool(live)") == 0)
+            return rows[i].bytes;
+    return 0;
+}
+
+// Oversize is refused at the radio queue in Router::send(). If one ever gets this far the memcpy is
+// clamped instead of failing, and the packet stays the caller's to release.
+static void test_beginSending_oversizedPayloadIsClamped()
+{
+    const int32_t liveBefore = packetPoolLiveBytes();
+
+    meshtastic_MeshPacket *p = packetPool.allocZeroed();
+    TEST_ASSERT_NOT_NULL(p);
+    // Without this the check below would also pass against a dead probe.
+    TEST_ASSERT_GREATER_THAN_INT32(liveBefore, packetPoolLiveBytes());
+
+    p->from = 0x12345678;
+    p->to = 0x87654321;
+    p->id = 0x10203040;
+    p->which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
+    p->encrypted.size = MAX_RADIO_PAYLOAD_LEN + 10;
+
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(MAX_LORA_PAYLOAD_LEN, testRadio->beginSendingPublic(p),
+                                   "an oversized payload must be clamped to the PHY limit, not rejected");
+    TEST_ASSERT_EQUAL_PTR_MESSAGE(p, testRadio->getSendingPacket(), "beginSending must still take the packet");
+
+    // beginSending has no failure path that releases, so the packet is ours to free.
+    testRadio->clearSendingPacketForTest();
+    packetPool.release(p);
+    TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
+}
+
+// The clamp must not shorten ordinary traffic, and a maximum-size frame must still fit the PHY.
+static void test_beginSending_fittingPayloadIsSentWhole()
+{
+    meshtastic_MeshPacket *p = packetPool.allocZeroed();
+    TEST_ASSERT_NOT_NULL(p);
+    p->from = 0x12345678;
+    p->to = 0x87654321;
+    p->id = 0x10203041;
+    p->which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
+    p->encrypted.size = MAX_RADIO_PAYLOAD_LEN;
+
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(MAX_LORA_PAYLOAD_LEN, testRadio->beginSendingPublic(p),
+                                   "the largest allowed payload must produce a frame at the PHY limit");
+    testRadio->clearSendingPacketForTest();
+    packetPool.release(p);
+}
+
+// ---------------------------------------------------------------------------
+// TX-delay provenance. setTransmitDelay() used to infer "we wrote this packet" from
+// rx_snr == 0 && rx_rssi == 0, which is also what every off-air arrival looks like: UDP multicast
+// and MQTT carry no RF measurement at all. Relaying one was therefore scheduled in the originator's
+// own contention window instead of behind it. isLocallyOriginated() asks transport_mechanism.
+// ---------------------------------------------------------------------------
+
+/// Carries rx_snr == 0 && rx_rssi == 0 - the exact shape the old heuristic read as ours.
+static meshtastic_MeshPacket makeUnmeasuredPacket(meshtastic_MeshPacket_TransportMechanism transport)
+{
+    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
+    p.from = 0x22222222;
+    p.id = 0x0BADF00D;
+    p.hop_start = 3;
+    p.hop_limit = 3;
+    p.transport_mechanism = transport;
+    return p;
+}
+
+static bool locallyOriginatedFor(meshtastic_MeshPacket_TransportMechanism transport)
+{
+    meshtastic_MeshPacket p = makeUnmeasuredPacket(transport);
+    return RadioInterface::isLocallyOriginated(&p);
+}
+
+static void test_isLocallyOriginated_readsProvenanceNotRfFields()
+{
+    // Ours: nothing arrived, we are the author. TRANSPORT_API is a local client handing us a packet
+    // over the packet API, which we then originate.
+    TEST_ASSERT_TRUE(locallyOriginatedFor(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_INTERNAL));
+    TEST_ASSERT_TRUE(locallyOriginatedFor(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_API));
+
+    // Someone else's, whatever carried it here - all four with no RF measurement to tell them apart.
+    TEST_ASSERT_FALSE(locallyOriginatedFor(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA));
+    TEST_ASSERT_FALSE(locallyOriginatedFor(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MULTICAST_UDP));
+    TEST_ASSERT_FALSE(locallyOriginatedFor(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_UNICAST_UDP));
+    TEST_ASSERT_FALSE(locallyOriginatedFor(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT));
+
+    // A transport this firmware does not set today, and whatever a client may put in the field,
+    // count as a relay: backing off too much costs latency, backing off too little costs collisions.
+    TEST_ASSERT_FALSE(locallyOriginatedFor(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA_ALT1));
+}
+
+static void test_offAirRelayCannotPreemptTheOriginator()
+{
+    const auto previousRole = config.device.role;
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT; // ROUTER is the one role that relays early
+
+    // The invariant: every relay delay clears the router offset, so a relay always lands after the
+    // window an origination draws from. Both halves are randomised, so sample rather than compare once.
+    const uint32_t relayFloor = 2 * TestableRadioInterface::cwMax() * testRadio->getSlotTimeMsec();
+    const meshtastic_MeshPacket_TransportMechanism offAir[] = {
+        meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MULTICAST_UDP,
+        meshtastic_MeshPacket_TransportMechanism_TRANSPORT_UNICAST_UDP,
+        meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT};
+
+    for (auto transport : offAir) {
+        meshtastic_MeshPacket p = makeUnmeasuredPacket(transport);
+        for (int i = 0; i < 32; i++)
+            TEST_ASSERT_GREATER_OR_EQUAL_UINT32(relayFloor, testRadio->getTxDelayMsecWeighted(&p));
+    }
+
+    // Asserted, not assumed: the origination window is CWmin-wide only while the channel is idle, and
+    // this pins the reason the misclassification was harmful rather than merely inaccurate.
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, airTime->channelUtilizationPercent());
+    for (int i = 0; i < 32; i++)
+        TEST_ASSERT_LESS_THAN_UINT32(relayFloor, testRadio->getTxDelayMsec());
+
+    config.device.role = previousRole;
+}
+
+// -----------------------------------------------------------------------
+// computePacketTime(): RadioLib error codes must never be read as durations (#11935)
+// -----------------------------------------------------------------------
+
+// computePacketTime() is a template over the driver, so only the calls it makes have to exist.
+class FakeLoraRadio
+{
+  public:
+    RadioLibTime_t reportedTimeOnAir = 0;   // what getTimeOnAir() answers
+    RadioLibTime_t calculatedTimeOnAir = 0; // what calculateTimeOnAir() answers
+    int16_t headerInfoResult = RADIOLIB_ERR_UNSUPPORTED;
+    uint8_t headerCodingRate = 0;
+    bool headerCrcEnabled = true;
+
+    uint32_t calculateCalls = 0;
+    uint8_t lastCodingRate = 0;
+    bool lastCrcEnabled = false;
+
+    RadioLibTime_t getTimeOnAir(size_t) { return reportedTimeOnAir; }
+
+    RadioLibTime_t calculateTimeOnAir(ModemType_t, DataRate_t dr, PacketConfig_t pc, size_t)
+    {
+        calculateCalls++;
+        lastCodingRate = dr.lora.codingRate;
+        lastCrcEnabled = pc.lora.crcEnabled;
+        return calculatedTimeOnAir;
+    }
+
+    int16_t getLoRaRxHeaderInfo(uint8_t *cr, bool *crc)
+    {
+        if (headerInfoResult == RADIOLIB_ERR_NONE) {
+            *cr = headerCodingRate;
+            *crc = headerCrcEnabled;
+        }
+        return headerInfoResult;
+    }
+};
+
+// A PhysicalLayer that answers only its IRQ flags, each generic RadioLib IRQ mapped to its own bit.
+class FakeIrqRadio : public PhysicalLayer
+{
+  public:
+    uint32_t irqFlags = 0;
+
+    FakeIrqRadio()
+    {
+        for (uint8_t i = 0; i < sizeof(irqMap) / sizeof(irqMap[0]); i++)
+            irqMap[i] = 1UL << i;
+    }
+
+    uint32_t getIrqFlags() override { return irqFlags; }
+    Module *getMod() override { return nullptr; }
+};
+
+// Test shim: no chip, just the modem parameters computePacketTime() reads.
+class TestableRadioLibInterface : public RadioLibInterface
+{
+  public:
+    explicit TestableRadioLibInterface(PhysicalLayer *phy = nullptr)
+        : RadioLibInterface(nullptr, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC, phy)
+    {
+    }
+
+    // What getPacketTime() answers, so checkStaleRxFlags() has a max-packet window to time against
+    uint32_t packetTimeMs = 0;
+
+    void setModem(uint8_t spreadFactor, float bandwidth, uint8_t codingRate)
+    {
+        sf = spreadFactor;
+        bw = bandwidth;
+        cr = codingRate;
+    }
+
+    uint32_t computePacketTimePublic(FakeLoraRadio &radio, uint32_t pl, bool received)
+    {
+        return computePacketTime(radio, pl, received);
+    }
+
+    static bool isRadioLibTimeErrorPublic(RadioLibTime_t usec) { return isRadioLibTimeError(usec); }
+
+    // What a chip with a receive FIFO is asked to drop when a frame is given up on unread
+    uint32_t discardedRxFrames = 0;
+    void discardUnreadRxFrame() override { discardedRxFrames++; }
+    void clearReadIrqsPublic() { clearReadIrqs(); }
+
+    // Chip-specific hooks this test never reaches
+    uint32_t getPacketTime(uint32_t, bool) override { return packetTimeMs; }
+    int16_t getCurrentRSSI() override { return 0; }
+    bool isChannelActive() override { return false; }
+    bool isActivelyReceiving() override { return false; }
+    void addReceiveMetadata(meshtastic_MeshPacket *) override {}
+    void setRadioIsr(void (*)()) override {}
+    void clearRadioIsr() override {}
+};
+
+static TestableRadioLibInterface *makeTestableRadioLibInterface()
+{
+    auto *radioIf = new TestableRadioLibInterface();
+    radioIf->setModem(11, 250.0f, 5); // LONG_FAST
+    return radioIf;
+}
+
+// A healthy chip answers getTimeOnAir(), and that answer is what we report.
+static void test_computePacketTime_txUsesTheRadiosOwnAnswer()
+{
+    auto *radioIf = makeTestableRadioLibInterface();
+    FakeLoraRadio radio;
+    radio.reportedTimeOnAir = 123456; // usec
+    radio.calculatedTimeOnAir = 999000;
+
+    TEST_ASSERT_EQUAL_UINT32(123, radioIf->computePacketTimePublic(radio, 32, false));
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, radio.calculateCalls, "a working radio must not need the fallback");
+
+    delete radioIf;
+}
+
+// WRONG_MODEM read as a duration is 4294967ms of airtime for one packet, which stops the node
+// transmitting until it is rebooted.
+static void test_computePacketTime_txFallsBackWhenTheRadioReportsAnError()
+{
+    auto *radioIf = makeTestableRadioLibInterface();
+    FakeLoraRadio radio;
+    radio.reportedTimeOnAir = (RadioLibTime_t)RADIOLIB_ERR_WRONG_MODEM;
+    radio.calculatedTimeOnAir = 500000; // usec, from the modem config we asked for
+
+    uint32_t msec = radioIf->computePacketTimePublic(radio, 32, false);
+
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(500, msec, "an error must fall back to the configured modem, not be divided by 1000");
+    TEST_ASSERT_EQUAL_UINT32(1, radio.calculateCalls);
+
+    delete radioIf;
+}
+
+// If the fallback fails too, report no airtime rather than let a code reach the airtime windows.
+static void test_computePacketTime_reportsNoAirtimeWhenNothingCanBeComputed()
+{
+    auto *radioIf = makeTestableRadioLibInterface();
+    FakeLoraRadio radio;
+    radio.reportedTimeOnAir = (RadioLibTime_t)RADIOLIB_ERR_WRONG_MODEM;
+    radio.calculatedTimeOnAir = (RadioLibTime_t)RADIOLIB_ERR_INVALID_CODING_RATE;
+
+    TEST_ASSERT_EQUAL_UINT32(0, radioIf->computePacketTimePublic(radio, 32, false));
+
+    delete radioIf;
+}
+
+// The RX path still takes coding rate and CRC from the header, and is guarded the same way.
+static void test_computePacketTime_rxUsesHeaderInfoAndIsGuarded()
+{
+    auto *radioIf = makeTestableRadioLibInterface();
+    FakeLoraRadio radio;
+    radio.headerInfoResult = RADIOLIB_ERR_NONE;
+    radio.headerCodingRate = 2; // raw header value for 4/6
+    radio.headerCrcEnabled = false;
+    radio.calculatedTimeOnAir = 78000;
+
+    TEST_ASSERT_EQUAL_UINT32(78, radioIf->computePacketTimePublic(radio, 32, true));
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(6, radio.lastCodingRate, "raw header coding rate must become a denominator");
+    TEST_ASSERT_FALSE(radio.lastCrcEnabled);
+
+    radio.calculatedTimeOnAir = (RadioLibTime_t)RADIOLIB_ERR_WRONG_MODEM;
+    TEST_ASSERT_EQUAL_UINT32(0, radioIf->computePacketTimePublic(radio, 32, true));
+
+    delete radioIf;
+}
+
+// Every RADIOLIB_ERR_* is rejected, every duration a LoRa packet can actually take is kept.
+static void test_isRadioLibTimeError_separatesCodesFromDurations()
+{
+    TEST_ASSERT_TRUE(TestableRadioLibInterface::isRadioLibTimeErrorPublic((RadioLibTime_t)RADIOLIB_ERR_WRONG_MODEM));
+    TEST_ASSERT_TRUE(TestableRadioLibInterface::isRadioLibTimeErrorPublic((RadioLibTime_t)RADIOLIB_ERR_UNKNOWN));
+    TEST_ASSERT_TRUE(TestableRadioLibInterface::isRadioLibTimeErrorPublic((RadioLibTime_t)RADIOLIB_ERR_SPI_CMD_FAILED));
+    TEST_ASSERT_TRUE_MESSAGE(TestableRadioLibInterface::isRadioLibTimeErrorPublic(0), "the PhysicalLayer stub answers 0");
+
+    TEST_ASSERT_FALSE(TestableRadioLibInterface::isRadioLibTimeErrorPublic(1));
+    TEST_ASSERT_FALSE(TestableRadioLibInterface::isRadioLibTimeErrorPublic(123456));
+    // ~229s: SF12 at 7.8kHz with a full 255-byte frame, the slowest packet that can be configured.
+    TEST_ASSERT_FALSE(TestableRadioLibInterface::isRadioLibTimeErrorPublic(229ul * 1000ul * 1000ul));
+}
+
+// clearReadIrqs() is how every early out gives up on a received frame unread: the readout task's bad length and full
+// ring, and the radio thread's bad length, unset region and failed readData(). The LR2021 receives into a FIFO that only
+// RadioLib's readData() empties, so r113 found each such drop left the frame's bytes at the front of the FIFO, and the
+// next frame was read out on top of them and failed to decode - 37 of 37 drops on an X1.
+//
+// Pinned: dropping a frame's flags also asks the chip to drop the frame. Regression guarded: a drop path that clears
+// only the IRQs, which corrupts the following frame on an LR2021 and is invisible on every other chip.
+
+static void test_clearReadIrqs_alsoDiscardsTheUnreadFrame()
+{
+    FakeIrqRadio phy;
+    TestableRadioLibInterface radioIf(&phy);
+    phy.irqFlags = (1UL << RADIOLIB_IRQ_RX_DONE);
+
+    radioIf.clearReadIrqsPublic();
+
+    TEST_ASSERT_EQUAL_UINT32(1, radioIf.discardedRxFrames);
+}
+
 void setUp(void)
 {
     mockMeshService = new MockMeshService();
@@ -393,6 +797,73 @@ void tearDown(void)
     mockMeshService = nullptr;
 }
 
+// staleRxFlagAction() in src/mesh/RadioInterface.h: the decision behind RadioLibInterface::checkStaleRxFlags(),
+// the plain-RX twin of checkCadHandoffTimeout(). Plain RX runs with no chip timeout, and the DIO mask carries
+// RX_DONE only, so a PREAMBLE_DETECTED, HEADER_VALID or HEADER_ERR that never completes stays latched until
+// something re-arms RX - on an idle node, never. RX_DONE clears every flag in readData(), so a flag still
+// latched one max packet after it was first seen has no frame behind it.
+//
+// Pinned: nothing happens inside that window (a frame may still be arriving); after it, a bare preamble is
+// only cleared, because a clear never aborts a reception; a header re-arms, because SX1280 DS rev 3.3 16.2
+// leaves RX wedged after a header error with no RX_DONE or timeout to follow, and a clear does not unwedge it.
+// Regressions guarded: re-arming on a preamble (startReceive() goes through standby, which aborts a frame
+// that is in fact arriving), acting before the window closes, or never acting at all.
+
+static void test_staleRxFlagAction_keepsFlagsInsideTheWindow()
+{
+    TEST_ASSERT_EQUAL(static_cast<int>(StaleRxFlagAction::Keep), static_cast<int>(staleRxFlagAction(false, 0, 99)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StaleRxFlagAction::Keep), static_cast<int>(staleRxFlagAction(true, 98, 99)));
+}
+
+static void test_staleRxFlagAction_windowEndsAtExactlyOneMaxPacket()
+{
+    // Inclusive at the boundary, matching Throttle::hasElapsed().
+    TEST_ASSERT_EQUAL(static_cast<int>(StaleRxFlagAction::ClearPreamble), static_cast<int>(staleRxFlagAction(false, 99, 99)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StaleRxFlagAction::Rearm), static_cast<int>(staleRxFlagAction(true, 99, 99)));
+}
+
+static void test_staleRxFlagAction_barePreambleIsOnlyCleared()
+{
+    TEST_ASSERT_EQUAL(static_cast<int>(StaleRxFlagAction::ClearPreamble), static_cast<int>(staleRxFlagAction(false, 2200, 2115)));
+}
+
+static void test_staleRxFlagAction_staleHeaderIsRearmed()
+{
+    TEST_ASSERT_EQUAL(static_cast<int>(StaleRxFlagAction::Rearm), static_cast<int>(staleRxFlagAction(true, 60000, 2115)));
+}
+
+// checkStaleRxFlags() itself, which the cases above cannot see: a header that shows after a bare preamble gets its own
+// max-packet window, timed from when the header showed. Regression guarded: timing the header from the earlier
+// preamble's stamp, which re-arms RX - a standby that aborts the frame whose header has only just arrived.
+static void test_checkStaleRxFlags_headerAfterPreambleRestartsTheWindow()
+{
+    FakeIrqRadio phy;
+    auto *radioIf = new TestableRadioLibInterface(&phy);
+    radioIf->packetTimeMs = 100;
+
+    Time::setTestMillis(1000);
+    phy.irqFlags = phy.getIrqMapped(1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED);
+    radioIf->checkStaleRxFlags();
+    TEST_ASSERT_EQUAL_UINT32(1000, radioIf->rxFlagsSeenMs);
+    TEST_ASSERT_FALSE(radioIf->rxFlagsSeenHeader);
+
+    // The header shows inside the preamble's window: its own window starts here
+    Time::setTestMillis(1090);
+    phy.irqFlags |= phy.getIrqMapped(1UL << RADIOLIB_IRQ_HEADER_VALID);
+    radioIf->checkStaleRxFlags();
+    TEST_ASSERT_EQUAL_UINT32(1090, radioIf->rxFlagsSeenMs);
+    TEST_ASSERT_TRUE(radioIf->rxFlagsSeenHeader);
+
+    // Past one max packet from the preamble, not from the header: nothing happens
+    Time::setTestMillis(1150);
+    radioIf->checkStaleRxFlags();
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1090, radioIf->rxFlagsSeenMs, "the header must be timed from when it showed");
+    TEST_ASSERT_TRUE(radioIf->rxFlagsSeenHeader);
+
+    Time::useRealClock();
+    delete radioIf;
+}
+
 void setup()
 {
     delay(10);
@@ -401,7 +872,9 @@ void setup()
     initializeTestEnvironment();
 
     UNITY_BEGIN();
+    airTimeFixture = std::make_unique<ScopedAirTimeFixture>();
     RUN_TEST(test_lr20x0BandClassification);
+    RUN_TEST(test_lr20x0CustomLfPaBandCoversOnly500To1000MHz);
     RUN_TEST(test_lr20x0BandHopDetection);
     RUN_TEST(test_lr20x0ReconfigurePathSelection);
     RUN_TEST(test_bwCodeToKHz_specialMappings);
@@ -422,7 +895,25 @@ void setup()
     RUN_TEST(test_clampConfigLora_mediumTurboValidForUS);
     RUN_TEST(test_regionPresetMap_coversAllRegionsWithinBounds);
     RUN_TEST(test_regionPresetMap_matchesRegionTable);
-    exit(UNITY_END());
+    RUN_TEST(test_regionPresetMap_unsetCarriesUserprefsIntent);
+    RUN_TEST(test_beginSending_oversizedPayloadIsClamped);
+    RUN_TEST(test_beginSending_fittingPayloadIsSentWhole);
+    RUN_TEST(test_isLocallyOriginated_readsProvenanceNotRfFields);
+    RUN_TEST(test_offAirRelayCannotPreemptTheOriginator);
+    RUN_TEST(test_computePacketTime_txUsesTheRadiosOwnAnswer);
+    RUN_TEST(test_computePacketTime_txFallsBackWhenTheRadioReportsAnError);
+    RUN_TEST(test_computePacketTime_reportsNoAirtimeWhenNothingCanBeComputed);
+    RUN_TEST(test_computePacketTime_rxUsesHeaderInfoAndIsGuarded);
+    RUN_TEST(test_isRadioLibTimeError_separatesCodesFromDurations);
+    RUN_TEST(test_clearReadIrqs_alsoDiscardsTheUnreadFrame);
+    RUN_TEST(test_staleRxFlagAction_keepsFlagsInsideTheWindow);
+    RUN_TEST(test_staleRxFlagAction_windowEndsAtExactlyOneMaxPacket);
+    RUN_TEST(test_staleRxFlagAction_barePreambleIsOnlyCleared);
+    RUN_TEST(test_staleRxFlagAction_staleHeaderIsRearmed);
+    RUN_TEST(test_checkStaleRxFlags_headerAfterPreambleRestartsTheWindow);
+    const int result = UNITY_END();
+    airTimeFixture.reset();
+    exit(result);
 }
 
 void loop() {}

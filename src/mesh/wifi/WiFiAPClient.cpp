@@ -1,3 +1,4 @@
+#include "UptimeClock.h"
 #include "configuration.h"
 #if HAS_WIFI
 #include "NodeDB.h"
@@ -48,6 +49,14 @@ NTPClient timeClient(ntpUDP, config.network.ntp_server);
 
 uint8_t wifiDisconnectReason = 0;
 
+#ifdef ARCH_ESP32
+// Unlike wifiDisconnectReason, which every failed (re)connect attempt overwrites, these only move when
+// an associated link goes down - so they say how often a working link drops and why.
+static bool wifiStaLinkUp = false;
+static uint32_t wifiDropCount = 0;
+static uint8_t wifiDropReason = 0;
+#endif
+
 // Stores our hostname
 char ourHost[16];
 
@@ -56,6 +65,11 @@ static unsigned long wifiReconnectStartMillis = 0;
 static bool wifiReconnectPending = false;
 
 bool APStartupComplete = 0;
+
+#if defined(ARCH_ESP32) && defined(MESHTASTIC_INCLUDE_SOFTAP)
+// Declared here (rather than next to startSoftAP() below) so isWifiAvailable() can see it too.
+static bool softAPStarted = false;
+#endif
 
 unsigned long lastrun_ntp = 0;
 
@@ -222,6 +236,9 @@ static void onNetworkConnected()
             syslog.appName("Meshtastic");
             syslog.defaultPriority(LOGLEVEL_USER);
             syslog.enable();
+#ifdef ARCH_ESP32
+            esp32LogResetReason();
+#endif
         }
 
 #if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WEBSERVER
@@ -302,7 +319,7 @@ static int32_t reconnectWiFi()
             tv.tv_usec = 0;
 
             perhapsSetRTC(RTCQualityNTP, &tv);
-            lastrun_ntp = millis();
+            lastrun_ntp = Time::skipZero(Time::getMillis());
         } else {
             LOG_DEBUG("NTP Update failed");
         }
@@ -333,6 +350,12 @@ bool isWifiAvailable()
     } else if (config.network.eth_enabled) {
         return true;
 #endif
+#if defined(ARCH_ESP32) && defined(MESHTASTIC_INCLUDE_SOFTAP)
+    } else if (softAPStarted) {
+        // No STA/ETH configured, but our fixed SoftAP is up - e.g. needed so createSSLCert()
+        // (called from startSoftAP()) doesn't no-op before the AP-only WebServer can get a cert.
+        return true;
+#endif
 #ifndef ARCH_PORTDUINO
     } else if (WiFi.status() == WL_CONNECTED) {
         // it's likely we have wifi now, but user intends to turn it off in config!
@@ -358,11 +381,68 @@ void deinitWifi()
         LOG_INFO("WiFi Turned Off");
         // WiFi.printDiag(Serial);
     }
+#if defined(ARCH_ESP32) && defined(MESHTASTIC_INCLUDE_SOFTAP)
+    softAPStarted = false; // WIFI_OFF above drops the SoftAP too; keep isWifiAvailable() honest
+#endif
 }
+
+#if defined(ARCH_ESP32) && defined(MESHTASTIC_INCLUDE_SOFTAP)
+#ifndef WIFI_SOFTAP_SSID
+#define WIFI_SOFTAP_SSID "MESHTASTIC"
+#endif
+
+// Fixed SoftAP, gated purely by the MESHTASTIC_INCLUDE_SOFTAP build flag (see platformio.ini).
+// SSID is constant; the PSK is derived from the Bluetooth fixed pairing PIN
+// (config.bluetooth.fixed_pin, normally sourced from USERPREFS_FIXED_BLUETOOTH in userPrefs.jsonc)
+// so it doesn't have to be maintained in two places.
+static bool startSoftAP()
+{
+    if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_FIXED_PIN) {
+        // Without a fixed BT PIN, fixed_pin is unused/zero - the derived PSK would be
+        // predictable/static across devices. Warn but proceed (this is the "simplest version").
+        LOG_WARN("SoftAP PSK is derived from a non-fixed Bluetooth PIN (config.bluetooth.mode != FIXED_PIN); "
+                 "set USERPREFS_FIXED_BLUETOOTH for a meaningful, per-build PSK");
+    }
+
+    // WPA2-PSK on ESP32 requires 0 (open) or 8..63 chars. The BT pairing PIN is always <=6
+    // digits, so prefix it to reach the 8-char minimum while keeping it visibly PIN-derived.
+    char psk[16];
+    snprintf(psk, sizeof(psk), "MT%06u", config.bluetooth.fixed_pin);
+
+    // Preserve STA mode if it's about to be (or already) requested, so AP+STA can coexist.
+    wifi_mode_t curMode = WiFi.getMode();
+    bool staWanted = config.network.wifi_enabled && config.network.wifi_ssid[0];
+    WiFi.mode((staWanted || curMode == WIFI_MODE_STA || curMode == WIFI_MODE_APSTA) ? WIFI_MODE_APSTA : WIFI_MODE_AP);
+
+    if (!WiFi.softAP(WIFI_SOFTAP_SSID, psk)) {
+        LOG_ERROR("Failed to start SoftAP ssid=%s", WIFI_SOFTAP_SSID);
+        return false;
+    }
+
+    softAPStarted = true;
+    LOG_INFO("SoftAP started: ssid=%s ip=%s", WIFI_SOFTAP_SSID, WiFi.softAPIP().toString().c_str());
+
+    // AP-only boots never reach the STA branch of initWifi() that normally does this registration,
+    // so do it here too. If STA also runs afterwards it skips its own registration (see there) to
+    // avoid registering the same handler twice (which would double every log line).
+    WiFi.onEvent(WiFiEvent);
+
+#if !MESHTASTIC_EXCLUDE_WEBSERVER
+    createSSLCert(); // For WebServer - AP-only boots never reach the STA branch below that normally does this
+#endif
+    // AP already has an IP the moment it's up; unlike STA we don't need to wait for GOT_IP.
+    onNetworkConnected(); // Idempotent (guarded by APStartupComplete)
+    return true;
+}
+#endif // defined(ARCH_ESP32) && defined(MESHTASTIC_INCLUDE_SOFTAP)
 
 // Startup WiFi
 bool initWifi()
 {
+#if defined(ARCH_ESP32) && defined(MESHTASTIC_INCLUDE_SOFTAP)
+    startSoftAP();
+#endif
+
     if (config.network.wifi_enabled && config.network.wifi_ssid[0]) {
 
         const char *wifiName = config.network.wifi_ssid;
@@ -379,7 +459,11 @@ bool initWifi()
             getMacAddr(dmac);
             snprintf(ourHost, sizeof(ourHost), "Meshtastic-%02x%02x", dmac[4], dmac[5]);
 
+#if defined(ARCH_ESP32) && defined(MESHTASTIC_INCLUDE_SOFTAP)
+            WiFi.mode(softAPStarted ? WIFI_MODE_APSTA : WIFI_MODE_STA); // Don't clobber the SoftAP we just started
+#else
             WiFi.mode(WIFI_STA);
+#endif
             WiFi.setHostname(ourHost);
 
             if (config.network.address_mode == meshtastic_Config_NetworkConfig_AddressMode_STATIC &&
@@ -396,7 +480,12 @@ bool initWifi()
             // Register WiFi event handler BEFORE createSSLCert() to prevent race condition:
             // Without this, WiFi can auto-reconnect during cert generation and fire GOT_IP
             // before the handler is registered, causing onNetworkConnected() to never run.
+#if defined(MESHTASTIC_INCLUDE_SOFTAP)
+            if (!softAPStarted) // startSoftAP() already registered it; don't do it twice
+                WiFi.onEvent(WiFiEvent);
+#else
             WiFi.onEvent(WiFiEvent);
+#endif
             WiFi.setAutoReconnect(true);
             WiFi.setSleep(false);
 
@@ -415,6 +504,11 @@ bool initWifi()
                             https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi.html#wi-fi-reason-code
                     */
                     wifiDisconnectReason = info.wifi_sta_disconnected.reason;
+                    if (wifiStaLinkUp) {
+                        wifiStaLinkUp = false;
+                        wifiDropCount++;
+                        wifiDropReason = info.wifi_sta_disconnected.reason;
+                    }
                 },
                 WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 #endif
@@ -429,6 +523,10 @@ bool initWifi()
         }
         return true;
     } else {
+#if defined(ARCH_ESP32) && defined(MESHTASTIC_INCLUDE_SOFTAP)
+        if (softAPStarted)
+            return true; // AP-only: no STA credentials configured, but the SoftAP is up
+#endif
         LOG_INFO("Not using WIFI");
         return false;
     }
@@ -473,6 +571,7 @@ static void WiFiEvent(WiFiEvent_t event)
         break;
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
         LOG_INFO("Connected to access point");
+        wifiStaLinkUp = true;
         if (config.network.ipv6_enabled) {
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
             if (!WiFi.enableIPv6()) {
@@ -662,4 +761,16 @@ uint8_t getWifiDisconnectReason()
 {
     return wifiDisconnectReason;
 }
+
+#ifdef ARCH_ESP32
+uint32_t getWifiDropCount()
+{
+    return wifiDropCount;
+}
+
+uint8_t getWifiDropReason()
+{
+    return wifiDropReason;
+}
+#endif
 #endif // HAS_WIFI

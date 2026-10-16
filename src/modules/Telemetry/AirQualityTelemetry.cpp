@@ -1,4 +1,5 @@
 #include "DebugConfiguration.h"
+#include "UptimeClock.h"
 #include "configuration.h"
 
 #if HAS_TELEMETRY && !MESHTASTIC_EXCLUDE_AIR_QUALITY_SENSOR
@@ -244,7 +245,7 @@ int32_t AirQualityTelemetryModule::runOnce()
         } else if (phoneDue && phoneAllowed) {
             // Mesh transmission isn't due yet, but we can still update the phone.
             if (sendTelemetry(NODENUM_BROADCAST, true)) {
-                lastSentToPhone = millis();
+                lastSentToPhone = Time::skipZero(Time::getMillis());
                 // Correct the awake time, trimming to 0
                 const unsigned long elapsed = millis() - startAirQualityTelemetryCycle;
                 awakeAheadOfTimeMs = elapsed >= awakeAheadOfTimeMs ? 0 : awakeAheadOfTimeMs - elapsed;
@@ -428,7 +429,7 @@ bool AirQualityTelemetryModule::getAirQualityTelemetry(meshtastic_Telemetry *m)
     // There, if any sensor fails to read - valid = false.
     bool valid = false;
     bool hasSensor = false;
-    m->time = getTime();
+    m->time = getValidTime(RTCQualityFromNet); // 0 (field omitted) until the clock is set, never a boot-relative 1970 time
     m->which_variant = meshtastic_Telemetry_air_quality_metrics_tag;
     m->variant.air_quality_metrics = meshtastic_AirQualityMetrics_init_zero;
 
@@ -480,7 +481,7 @@ bool AirQualityTelemetryModule::sendTelemetry(NodeNum dest, bool phoneOnly)
 {
     meshtastic_Telemetry m = meshtastic_Telemetry_init_zero;
     m.which_variant = meshtastic_Telemetry_air_quality_metrics_tag;
-    m.time = getTime();
+    m.time = getValidTime(RTCQualityFromNet);
 
     bool validTelemetry = getAirQualityTelemetry(&m);
     if (validTelemetry) {

@@ -31,10 +31,10 @@ class PositionModule : public ProtobufModule<meshtastic_Position>, private concu
     PositionModule();
 
     /**
-     * Send our position into the mesh
+     * Send our position into the mesh. True only when the router took the packet.
      */
-    void sendOurPosition(NodeNum dest, bool wantReplies = false, uint8_t channel = 0);
-    void sendOurPosition();
+    bool sendOurPosition(NodeNum dest, bool wantReplies = false, uint8_t channel = 0);
+    bool sendOurPosition();
 
     /**
      * Answer a position request that arrived on a channel we never share position on (the event channel):
@@ -58,6 +58,15 @@ class PositionModule : public ProtobufModule<meshtastic_Position>, private concu
     // still honors the cadence.
     static bool shouldSendPositionToPhone(bool hasValidPosition, bool phoneQueueEmpty, bool everSentToPhone, uint32_t nowMs,
                                           uint32_t lastSentMs, uint32_t intervalMs);
+    // Pure mesh-time policy: may a remote position's time set our clock, given where the sender's
+    // position came from? GPS/phone sources always qualify. A fixed (manual) position qualifies only
+    // with acceptFixed: its sender includes time only at NTP/GPS/phone quality (or from an RTC chip),
+    // so a Wi-Fi gateway with NTP can then seed the clocks of field nodes that have no other source.
+    static bool meshTimeSourceTrusted(meshtastic_Position_LocSource source, bool acceptFixed);
+    // Pure mesh-time policy for the channel a position arrived on: the primary channel always. With
+    // acceptPrivateSecondary, also a secondary channel whose key is not publicly decryptable - a network
+    // that shares positions only on its own private channel would otherwise never hear a usable time.
+    static bool meshTimeChannelTrusted(bool isPrimary, bool usesPublicKey, bool acceptPrivateSecondary);
 
   protected:
     /** Called to handle a particular incoming message
@@ -85,6 +94,9 @@ class PositionModule : public ProtobufModule<meshtastic_Position>, private concu
     uint32_t lastPhoneSendMs = 0;
     static constexpr uint32_t sendToPhoneIntervalMs = 60 * 1000; // Matches telemetry's local cadence
     struct SmartPosition getDistanceTraveledSinceLastSend(meshtastic_PositionLite currentPosition);
+    // Broadcast early when we have moved far enough since the last send, subject to the minimum
+    // interval. Stamps the cadence and the last-sent coords only on a send that went out.
+    void trySmartBroadcast(const meshtastic_PositionLite &selfPos, uint32_t nowMs);
     // True when our position is unchanged since the last broadcast: it truncates to the same
     // precision grid cell, so re-sending would be a duplicate that traffic management dedups
     // downstream anyway. Used to hold stationary broadcasts to a 12h floor. useConfiguredPrecision

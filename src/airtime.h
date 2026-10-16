@@ -34,6 +34,8 @@
   OUTPUTS:
 
     channelUtilizationPercent()  % of the last 60s busy, all three types
+    smoothedChannelUtilizationPercent()
+                                 the same, behind a ~21 min EMA folded per bucket
     utilizationTXPercent()       % of the last hour we transmitted
     isTxAllowedChannelUtil()     gate on the former, 40% or 25% "polite"
     isTxAllowedAirUtil()         gate on the latter, at HALF the duty cycle
@@ -77,6 +79,9 @@
 */
 
 #define CHANNEL_UTILIZATION_PERIODS 6
+// EMA weight per crossed 10 s bucket: 1/128 is a time constant of about 21 minutes, so one busy
+// or quiet minute cannot move the smoothed figure far.
+#define CHANNEL_UTILIZATION_EMA_DIVISOR 128
 #define SECONDS_PER_PERIOD 3600
 #define PERIODS_TO_LOG 8
 #define MINUTES_IN_HOUR 60
@@ -84,7 +89,38 @@
 #define MS_IN_MINUTE (SECONDS_IN_MINUTE * 1000)
 #define MS_IN_HOUR (MINUTES_IN_HOUR * SECONDS_IN_MINUTE * 1000)
 
+// MT-SW: 10-minute-granularity activity window, ported from the historical fw+ AirTime (which kept it
+// unlocked and rotated it off a per-second OSThread tick - see Windows::syncNow()'s comment below for
+// why that rotation trigger was replaced). Deliberately finer-grained and shorter-range than
+// airtimes.period{TX,RX,RX_ALL}[] above (10 x 10min = ~100min vs 8 x 1h), and carries idle_time, which
+// the hourly view does not.
+#define RX_WINDOW_INTERVAL_SECONDS 600 // fw+ 10min
+#define ACTIVITY_WINDOW_COUNT 10       // fw+ 10 x 10min windows
+// fw+: average ms of airtime per RX_LOG-or-RX_ALL_LOG packet, over each completed 10-minute window.
+// Same RX_WINDOW_INTERVAL_SECONDS cadence as activityWindow above, but a longer independent history -
+// 40 windows (~6.67h) vs activityWindow's 10 (~100min). Rolls over in the same syncNow() pass as
+// activityWindow, but its own bulk-clear threshold must stay independent: sleeping through, say, 15
+// windows clears activityWindow (>= 10) while rxWindowAverages (>= 40) still shifts normally.
+#define RX_WINDOW_COUNT 40 // fw+ 40 x 10min probes
+// fw+: count of RX+TX mesh packets (not ms of airtime) per completed 10-minute window - originally a
+// separate PacketCounter class fed from Router::sniffReceived()/Router::send(), folded in here to
+// reuse the same lock and syncNow() rollover as activityWindow/rxWindowAverages above instead of
+// building a second independent locking scheme for one more 10-minute-windowed counter. See
+// AirTime::logPacketSeen(): unlike everything else in this class, it is NOT called from logAirtime()
+// (packet counting, not airtime duration) - Router calls it directly.
+#define RXTXALL_ACTIVITY_COUNT 40 // fw+ 40 x 10min packet-count windows
+
 enum reportTypes { TX_LOG, RX_LOG, RX_ALL_LOG };
+
+// fw+: one completed RX_WINDOW_INTERVAL_SECONDS window's worth of tx/rx/rx_bad/idle time, in ms.
+// idle_time has no wire representation in meshtastic_AirActivityEntry (ondemand.proto) - it is
+// internal bookkeeping only, not currently exposed over OnDemand.
+struct ActivityTime {
+    uint32_t rx_time;
+    uint32_t tx_time;
+    uint32_t idle_time;
+    uint32_t rx_bad_time;
+};
 
 // Arms AirTime's nested-take check. Sound only where the lock is not a real lock: the check runs
 // before the take, because a nested take blocks forever and a later check would never run - so
@@ -130,6 +166,9 @@ class AirTime : private concurrency::OSThread
 
     void logAirtime(reportTypes reportType, uint32_t airtime_ms);
     float channelUtilizationPercent();
+    /// channelUtilizationPercent() behind an EMA advanced by elapsed time, for a caller that must
+    /// judge load from a trend rather than from one 60-second window.
+    float smoothedChannelUtilizationPercent();
     float utilizationTXPercent();
 
     /// Compatibility shim: no caller in the tree, kept for out-of-tree ones.
@@ -146,6 +185,28 @@ class AirTime : private concurrency::OSThread
     uint8_t getSilentMinutes(float txPercent, float dutyCycle);
     bool isTxAllowedChannelUtil(bool polite = false);
     bool isTxAllowedAirUtil();
+
+    /// Constant, not state - see getPeriodsToLog().
+    static constexpr uint8_t getActivityWindowCount() { return ACTIVITY_WINDOW_COUNT; }
+    /// Copies `count` 10-minute activity windows into `out`, oldest first (matches activityWindow's
+    /// own shift-and-append order). Same copy-out contract as airtimeReport().
+    bool activityWindowReport(ActivityTime *out, size_t count);
+
+    /// Constant, not state - see getPeriodsToLog().
+    static constexpr uint8_t getRxWindowCount() { return RX_WINDOW_COUNT; }
+    /// Copies `count` 10-minute RX-average-airtime windows into `out`, oldest first. Same copy-out
+    /// contract as airtimeReport()/activityWindowReport().
+    bool rxWindowAveragesReport(uint32_t *out, size_t count);
+
+    /// Count one RX+TX mesh packet into the current 10-minute window. Call once per packet from
+    /// Router::sniffReceived() (overheard RX) and Router::send() (our TX) - NOT from logAirtime(),
+    /// which this does not call and is not called from.
+    void logPacketSeen();
+    /// Constant, not state - see getPeriodsToLog().
+    static constexpr uint8_t getPacketCountWindowSize() { return RXTXALL_ACTIVITY_COUNT; }
+    /// Copies `count` 10-minute RX+TX packet-count windows into `out`, oldest first. Same copy-out
+    /// contract as the other *Report() methods.
+    bool packetCountWindowReport(uint32_t *out, size_t count);
 
   private:
     concurrency::Lock lock;
@@ -182,7 +243,12 @@ class AirTime : private concurrency::OSThread
 
         // Modular rings: index is absolute phase, (uptime secs / period) % N, never age.
         uint32_t channelUtilization[CHANNEL_UTILIZATION_PERIODS] = {0}; // 6 x 10s
-        uint32_t utilizationTX[MINUTES_IN_HOUR] = {0};                  // 60 x 60s, our TX only
+
+        // EMA over channelUtilization, folded in syncNow() once per crossed 10 s bucket so its
+        // time constant follows elapsed time rather than how often a caller happens to ask.
+        float channelUtilAvg = 0.0f;
+        bool hasChannelUtilSample = false;
+        uint32_t utilizationTX[MINUTES_IN_HOUR] = {0}; // 60 x 60s, our TX only
 
         // Hour crossings rotated but not yet traced. The core cannot log its own rotations: it
         // only ever runs under the lock, and DEBUG_PORT.log() blocks on a UART write. runOnce()
@@ -196,10 +262,42 @@ class AirTime : private concurrency::OSThread
             uint32_t periodRX_ALL[PERIODS_TO_LOG] = {0}; // AirTime received regardless of validity. May be noise.
         } airtimes;
 
+        // MT-SW/fw+: 10-minute activity window. Shift-ordered like airtimes.period* above, but
+        // opposite append end (oldest at [0], newest pushed in at the tail) to match the original
+        // fw+ AirTime::updateActivityWindow() shift direction - see the .cpp.
+        ActivityTime activityWindow[ACTIVITY_WINDOW_COUNT] = {};
+        // Accumulate ms since the current (incomplete) 10-minute window started; folded into
+        // activityWindow and zeroed when syncNow() detects the window closed.
+        uint32_t txAccum10 = 0, rxAccum10 = 0, rxBadAccum10 = 0;
+
+        // MT-SW/fw+: average ms of airtime per RX_LOG-or-RX_ALL_LOG packet, one entry per completed
+        // 10-minute window - same rollover as activityWindow, independent history length (see
+        // RX_WINDOW_COUNT's comment for why the two need separate bulk-clear thresholds).
+        uint32_t rxWindowAverages[RX_WINDOW_COUNT] = {0};
+        // Accumulate ms/count since the current (incomplete) 10-minute window started; folded into
+        // rxWindowAverages (as sum/count) and zeroed alongside txAccum10 et al.
+        uint32_t rxWindowSum = 0, rxWindowCount = 0;
+
+        // MT-SW/fw+: count of RX+TX mesh packets per completed 10-minute window (see
+        // RXTXALL_ACTIVITY_COUNT's comment) - same rollover cadence again, own accumulator.
+        uint32_t packetCountWindow[RXTXALL_ACTIVITY_COUNT] = {0};
+        uint32_t packetCount10 = 0;
+
         void logAirtime(reportTypes reportType, uint32_t airtime_ms, const Held &);
+        void logPacketSeen(const Held &);
         float channelUtilizationPercent(const Held &);
+        /// The bucket sum alone. syncNow() folds the EMA and cannot reach it through
+        /// channelUtilizationPercent(), which would re-enter syncNow().
+        float channelUtilizationPercentRaw(const Held &);
+        float smoothedChannelUtilizationPercent(const Held &);
+        /// Fold `steps` readings of `sample` into channelUtilAvg. Power by squaring, so a
+        /// multi-day sleep decays by the time elapsed in at most 32 multiplications.
+        void foldChannelUtil(float sample, uint32_t steps, const Held &);
         float utilizationTXPercent(const Held &);
         bool airtimeReport(reportTypes reportType, uint32_t *out, size_t count, const Held &);
+        bool activityWindowReport(ActivityTime *out, size_t count, const Held &);
+        bool rxWindowAveragesReport(uint32_t *out, size_t count, const Held &);
+        bool packetCountWindowReport(uint32_t *out, size_t count, const Held &);
         uint8_t getSilentMinutes(float txPercent, float dutyCycle, const Held &);
         uint8_t getPeriodUtilMinute(const Held &);
         uint8_t getPeriodUtilHour(const Held &);

@@ -1,3 +1,4 @@
+#include "MillisGlitchFilter.h"
 #include "PowerFSM.h"
 #include "PowerMon.h"
 #include "configuration.h"
@@ -29,8 +30,38 @@
 #include <driver/rtc_io.h>
 #include <esp_efuse.h>
 #include <esp_efuse_table.h>
+#include <esp_system.h>
 #include <nvs.h>
 #include <nvs_flash.h>
+
+// The console is the hardware USB-serial/JTAG peripheral only when Arduino's CDC-on-boot is on and the
+// PHY is not routed to TinyUSB - the same pair of macros SerialConsole.cpp gates IS_USB_HWCDC on.
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT && defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE &&              \
+    __has_include(<driver/usb_serial_jtag.h>)
+#include "mesh/Throttle.h"
+#include <driver/usb_serial_jtag.h>
+#define HAS_USB_CONSOLE_HOST_DETECT 1
+// How long a host stays "attached" after the last frame seen. The detector is frame-based, so a
+// single missed frame must not be enough to let a sleep through and cost the port.
+#define USB_CONSOLE_HOST_GRACE_MS 5000
+#endif
+
+bool usbConsoleHostAttached()
+{
+#ifdef HAS_USB_CONSOLE_HOST_DETECT
+    // Not HWCDC::isPlugged(), which flaps false while USB is fine (#11864, and the comment at
+    // SerialConsole.cpp:183-185). This answers "a host has the port open", so a node on a power bank
+    // with no host is unaffected and still sleeps.
+    static uint32_t lastSeenMs = 0;
+    if (usb_serial_jtag_is_connected()) {
+        lastSeenMs = millis() | 1; // never 0, which is this cache's "no host seen yet"
+        return true;
+    }
+    return lastSeenMs && Throttle::isWithinTimespanMs(lastSeenMs, USB_CONSOLE_HOST_GRACE_MS);
+#else
+    return false;
+#endif
+}
 
 // Weak empty variant shutdown prep function.
 // May be redefined by variant files.
@@ -41,6 +72,9 @@ void variant_shutdown() {}
 static bool bluetoothMemoryReleased;
 static bool bluetoothMemoryReleaseWarned;
 #endif
+
+// NVS "rebootCounter" as of this boot, repeated by esp32LogResetReason()
+static uint32_t deviceRebootCount;
 
 #if !defined(CONFIG_IDF_TARGET_ESP32S2) && !MESHTASTIC_EXCLUDE_BLUETOOTH
 static bool isNetworkConfiguredToDisableBluetooth()
@@ -259,6 +293,7 @@ void esp32Setup()
     if (hwven != HW_VENDOR)
         preferences.putUInt("hwVendor", HW_VENDOR);
     preferences.end();
+    deviceRebootCount = rebootCounter;
     LOG_DEBUG("Number of Device Reboots: %d", rebootCounter);
 #if !MESHTASTIC_EXCLUDE_WIFI
     String version = MeshtasticOTA::getVersion();
@@ -313,9 +348,118 @@ void esp32Loop()
 {
     esp_task_wdt_reset(); // service our app level watchdog
 
+#if MILLIS_GLITCH_FILTER
+    // The filter runs in ISR context and cannot log, so report what it dropped from here
+    static uint32_t reportedGlitches;
+    const MillisGlitchStats glitches = getMillisGlitchStats();
+    if (glitches.count != reportedGlitches) {
+        LOG_WARN("millis() glitch: dropped %u read(s) since the last report, the last %ums ahead of its re-read (%u total)",
+                 glitches.count - reportedGlitches, glitches.lastAheadMs, glitches.count);
+        reportedGlitches = glitches.count;
+    }
+#endif
+
     // for debug printing
     // radio.radioIf.canSleep();
 }
+
+// initDeepSleep() logs the reset reason before the network is up, so syslog never sees it, and its
+// rtc_get_reset_reason() mapping reports a panic and ESP.restart() alike. esp_reset_reason() tells a panic,
+// the watchdogs and a brownout apart. Called once syslog starts.
+void esp32LogResetReason()
+{
+    const esp_reset_reason_t reason = esp_reset_reason();
+    const char *name = "unknown";
+    bool unexpected = false;
+    switch (reason) {
+    case ESP_RST_POWERON:
+        name = "power-on";
+        break;
+    case ESP_RST_EXT:
+        name = "external pin";
+        break;
+    case ESP_RST_SW:
+        name = "software restart";
+        break;
+    case ESP_RST_DEEPSLEEP:
+        name = "deep sleep wake";
+        break;
+    case ESP_RST_USB:
+        name = "USB";
+        break;
+    case ESP_RST_JTAG:
+        name = "JTAG";
+        break;
+    case ESP_RST_PANIC:
+        name = "panic (exception/abort)";
+        unexpected = true;
+        break;
+    case ESP_RST_INT_WDT:
+        name = "interrupt watchdog";
+        unexpected = true;
+        break;
+    case ESP_RST_TASK_WDT:
+        name = "task watchdog";
+        unexpected = true;
+        break;
+    case ESP_RST_WDT:
+        name = "other watchdog";
+        unexpected = true;
+        break;
+    case ESP_RST_BROWNOUT:
+        name = "brownout";
+        unexpected = true;
+        break;
+    case ESP_RST_PWR_GLITCH:
+        name = "power glitch";
+        unexpected = true;
+        break;
+    case ESP_RST_CPU_LOCKUP:
+        name = "CPU lockup";
+        unexpected = true;
+        break;
+    case ESP_RST_SDIO:
+        name = "SDIO";
+        break;
+    case ESP_RST_EFUSE:
+        name = "efuse error";
+        unexpected = true;
+        break;
+    default:
+        break;
+    }
+    if (unexpected) {
+        LOG_WARN("Last reset reason: %s (%d), device reboots %u", name, (int)reason, (unsigned)deviceRebootCount);
+    } else {
+        LOG_INFO("Last reset reason: %s (%d), device reboots %u", name, (int)reason, (unsigned)deviceRebootCount);
+    }
+}
+
+#if SOC_PM_SUPPORT_EXT1_WAKEUP
+/**
+ * Drop any pin from an ext1 wake mask that this SoC cannot wake on.
+ *
+ * esp_sleep_enable_ext1_wakeup() clears the existing ext1 configuration *before* it validates the
+ * mask, so one non-RTC pin does not merely fail to arm itself - it returns ESP_ERR_INVALID_ARG with
+ * nothing armed at all. Callers here ignore that return, and a timed sleep still comes back on the
+ * RTC timer, so the failure stays invisible until a shutdown (portMAX_DELAY, no timer) leaves the
+ * device with no way back short of a reset. Filter first and name whatever gets dropped.
+ */
+static uint64_t filterExt1WakeMask(uint64_t gpioMask)
+{
+    uint64_t valid = 0;
+    for (int gpio = 0; gpio < SOC_GPIO_PIN_COUNT; gpio++) {
+        const uint64_t bit = 1ULL << gpio;
+        if (!(gpioMask & bit))
+            continue;
+        if (esp_sleep_is_valid_wakeup_gpio((gpio_num_t)gpio))
+            valid |= bit;
+        else
+            LOG_WARN("GPIO%d has no RTC function; dropped from the deep sleep wake mask", gpio);
+    }
+    return valid;
+}
+#endif
 
 void cpuDeepSleep(uint32_t msecToWake)
 {
@@ -345,16 +489,35 @@ void cpuDeepSleep(uint32_t msecToWake)
 #endif
         34, 35, 37};
 
-    for (int i = 0; i < sizeof(rtcGpios); i++)
-        rtc_gpio_isolate((gpio_num_t)rtcGpios[i]);
+    // A variant whose button is not an RTC IO can nominate a different pad here. This replaces the
+    // button rather than joining it: esp_sleep_enable_ext1_wakeup() validates the whole mask and
+    // arms nothing if any pin in it lacks RTC function, so one bad pin would veto the good one.
+#if defined(DEEP_SLEEP_WAKE_PIN)
+    const int wakeButton = DEEP_SLEEP_WAKE_PIN;
+#elif defined(BUTTON_PIN)
+    const int wakeButton = config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN;
+#else
+    const int wakeButton = -1;
+#endif
+    // Isolating a pad holds it, and ext1 cannot re-arm a held pad - skip the pin we wake on.
+    for (int i = 0; i < sizeof(rtcGpios); i++) {
+        if (rtcGpios[i] != wakeButton)
+            rtc_gpio_isolate((gpio_num_t)rtcGpios[i]);
+    }
 #endif
 
-        // FIXME, disable internal rtc pullups/pulldowns on the non isolated pins. for inputs that we aren't using
-        // to detect wake and in normal operation the external part drives them hard.
-#ifdef BUTTON_PIN
-        // Only GPIOs which are have RTC functionality can be used in this bit map: 0,2,4,12-15,25-27,32-39.
-#if SOC_RTCIO_HOLD_SUPPORTED && SOC_PM_SUPPORT_EXT_WAKEUP
-    uint64_t gpioMask = (1ULL << (config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN));
+    // FIXME, disable internal rtc pullups/pulldowns on the non isolated pins. for inputs that we aren't using
+    // to detect wake and in normal operation the external part drives them hard.
+#if defined(BUTTON_PIN) || defined(DEEP_SLEEP_WAKE_PIN)
+    // Only GPIOs with RTC functionality can go in this bit map, and which ones those are differs
+    // per SoC (ESP32 0,2,4,12-15,25-27,32-39 / S2 and S3 0-21 / C6 0-7 / H2 7-14 / P4 0-15).
+    // filterExt1WakeMask() below enforces that rather than each variant having to know it.
+    //
+    // Guard on SOC_PM_SUPPORT_EXT1_WAKEUP, not the SOC_PM_SUPPORT_EXT_WAKEUP alias: that alias
+    // exists only on ESP32/S2/S3 for IDF backwards compatibility, so keying off it silently
+    // drops the whole ext1 path on C6, H2 and P4, which all have the hardware.
+#if SOC_PM_SUPPORT_EXT1_WAKEUP
+    uint64_t gpioMask = (1ULL << wakeButton);
 #endif
 #ifdef ALT_BUTTON_WAKE
     gpioMask |= (1ULL << BUTTON_PIN_ALT);
@@ -367,19 +530,25 @@ void cpuDeepSleep(uint32_t msecToWake)
     // FIXME change polarity in hw so we can wake on ANY_HIGH instead - that would allow us to use all three buttons (instead
     // of just the first) gpio_pullup_en((gpio_num_t)BUTTON_PIN);
 
-#ifdef ESP32S3_WAKE_TYPE
-    esp_sleep_enable_ext1_wakeup(gpioMask, ESP32S3_WAKE_TYPE);
-#else
-#if SOC_PM_SUPPORT_EXT_WAKEUP
-#ifdef CONFIG_IDF_TARGET_ESP32
-    // ESP_EXT1_WAKEUP_ALL_LOW has been deprecated since esp-idf v5.4 for any other target.
-    esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ALL_LOW);
-#else
-    esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ANY_LOW);
-#endif
-#endif
+#if SOC_PM_SUPPORT_EXT1_WAKEUP
+    gpioMask = filterExt1WakeMask(gpioMask);
+    if (!gpioMask)
+        LOG_ERROR("No RTC-capable wake pin: deep sleep will not wake on a button");
 
-#endif // #end ESP32S3_WAKE_TYPE
+    esp_err_t wakeRes = ESP_OK;
+    if (gpioMask) {
+#ifdef ESP32S3_WAKE_TYPE
+        wakeRes = esp_sleep_enable_ext1_wakeup(gpioMask, ESP32S3_WAKE_TYPE);
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+        // ESP_EXT1_WAKEUP_ALL_LOW has been deprecated since esp-idf v5.4 for any other target.
+        wakeRes = esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ALL_LOW);
+#else
+        wakeRes = esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ANY_LOW);
+#endif
+    }
+    if (wakeRes != ESP_OK)
+        LOG_ERROR("esp_sleep_enable_ext1_wakeup failed (%d); deep sleep has no button wake", wakeRes);
+#endif // SOC_PM_SUPPORT_EXT1_WAKEUP
 #endif
     variant_shutdown();
 

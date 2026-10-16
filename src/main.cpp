@@ -25,6 +25,7 @@
 #include "Power.h"
 #include "SPILock.h"
 #include "Throttle.h"
+#include "WaypointStore.h"
 #include "concurrency/OSThread.h"
 #include "concurrency/Periodic.h"
 #include "detect/ScanI2C.h"
@@ -75,10 +76,8 @@ NimbleBluetooth *nimbleBluetooth = nullptr;
 NRF52Bluetooth *nrf52Bluetooth = nullptr;
 #endif
 
-#ifdef ARCH_NRF54L15
-void nrf54l15Setup();
-void nrf54l15Loop();
-NRF54L15Bluetooth *nrf54l15Bluetooth = nullptr;
+#ifdef MESHTASTIC_LINUX_BLE
+LinuxBluetooth *linuxBluetooth = nullptr;
 #endif
 
 #ifdef MESHTASTIC_ENABLE_APPROTECT
@@ -112,6 +111,7 @@ NRF54L15Bluetooth *nrf54l15Bluetooth = nullptr;
 #include "linux/LinuxHardwareI2C.h"
 #ifndef ARCH_PORTDUINO_WASM // raspi HTTP server (ulfius/zlib/openssl) excluded in the browser/wasm build
 #include "mesh/raspihttp/PiWebServer.h"
+#include "platform/portduino/NativeDiscovery.h"
 #endif
 #include "platform/portduino/PortduinoGlue.h"
 #ifdef _WIN32
@@ -179,9 +179,9 @@ MagnetometerThread *magnetometerThread = nullptr;
 AudioThread *audioThread = nullptr;
 #endif
 
-#ifdef USE_XL9555
-#include "ExtensionIOXL9555.hpp"
-ExtensionIOXL9555 io;
+#ifdef USE_PCA95X5
+#include PCA95X5_INC
+PCA95X5_CLS io;
 #endif
 
 #ifdef USE_MCP23017
@@ -306,7 +306,7 @@ void startBusy()
  		 
  		    if (--g_busyCounter == 0) {
  		        const uint32_t now = (uint32_t)micros();
- 		        g_totalBusyTimeUs += (uint64_t)(now - g_lastBusyStartUs);
+				g_totalBusyTimeUs += (uint64_t)(now - g_lastBusyStartUs);
  		        g_isBusy = false;
  		    }
  		}
@@ -315,53 +315,56 @@ void startBusy()
  		{
  		    if (g_isBusy) {
  		        const uint32_t now = (uint32_t)micros();
- 		        return g_totalBusyTimeUs + (uint64_t)(now - g_lastBusyStartUs);
+				return g_totalBusyTimeUs + (uint64_t)(now - g_lastBusyStartUs);
  		    } else {
  		        return g_totalBusyTimeUs;
  		    }
  		}
  		 
  		//void updateCpuUsageStats()
-        //{
-        //    uint64_t currentBusy = getTotalBusyTimeUs();
-        //    uint64_t deltaUs     = currentBusy - lastBusyUs;
-        //    lastBusyUs           = currentBusy;
-        //  
-        //    busyHistory[currentIndex] = deltaUs;
-        //    currentIndex = (currentIndex + 1) % 60;
-    ///      
-    //        uint64_t sumBusyUs = 0;
-    //        for (int i = 0; i < 60; i++) {
-    //            sumBusyUs += busyHistory[i];
-    //        }
-    //      
-    //        CpuHwUsagePercent = ( (float)sumBusyUs / (60.0f * 1000000.0f) ) * 100.0f;
-    // 
-//  }
+ 		//{
+ 		//    uint64_t currentBusy = getTotalBusyTimeUs();
+ 		//    uint64_t deltaUs     = currentBusy - lastBusyUs;
+ 		//    lastBusyUs           = currentBusy;
+ 		// 
+ 		//    busyHistory[currentIndex] = deltaUs;
+ 		//    currentIndex = (currentIndex + 1) % 60;
+ 	///	 
+ 	//	    uint64_t sumBusyUs = 0;
+ 	//	    for (int i = 0; i < 60; i++) {
+ 	//	        sumBusyUs += busyHistory[i];
+ 	//	    }
+ 	//	 
+ 	//	    CpuHwUsagePercent = ( (float)sumBusyUs / (60.0f * 1000000.0f) ) * 100.0f;
+ 	//
+//	}
+		
 void updateCpuUsageStats()
 {
     uint64_t currentBusy = getTotalBusyTimeUs();
     uint64_t deltaUs = currentBusy - lastBusyUs;
     lastBusyUs = currentBusy;
+
     // One sample should represent ~1s of wall time; clamp pathological values (e.g. stalled tick).
     const uint64_t maxReasonableBusyUsPerSample = 5ULL * 1000000ULL;
     if (deltaUs > maxReasonableBusyUsPerSample) {
         deltaUs = maxReasonableBusyUsPerSample;
     }
+
     busyHistory[currentIndex] = deltaUs;
     currentIndex = (currentIndex + 1) % 60;
+
     uint64_t sumBusyUs = 0;
     for (int i = 0; i < 60; i++) {
         sumBusyUs += busyHistory[i];
     }
+
     float pct = ((float)sumBusyUs / (60.0f * 1000000.0f)) * 100.0f;
     if (pct > 100.0f) {
         pct = 100.0f;
     }
     CpuHwUsagePercent = (uint32_t)pct;
 }
-		
-
 
         
 
@@ -372,7 +375,7 @@ const char *firmware_version = optstr(APP_VERSION_SHORT);
 
 const char *getDeviceName()
 {
-    uint8_t dmac[6];
+    uint8_t dmac[6] = {0};
 
     getMacAddr(dmac);
 
@@ -414,6 +417,8 @@ __attribute__((weak, noinline)) bool loopCanSleep()
 __attribute__((noinline)) void lateInitVariant() __attribute__((weak));
 __attribute__((noinline)) void lateInitVariant() {}
 
+// earlyInitVariant() runs before consoleInit(): a LOG_* macro here CRASHES the device,
+// it is not a silent no-op. Defer any logging to lateInitVariant() or later.
 __attribute__((noinline)) void earlyInitVariant() __attribute__((weak));
 __attribute__((noinline)) void earlyInitVariant() {}
 
@@ -541,6 +546,9 @@ void setup()
     // RTCQualityDevice rather than claim NTP quality we have not verified.
     std::string timeCommandResult = exec("timedatectl status | grep synchronized | grep yes -c");
     if (timeCommandResult[0] == '1') {
+        ourQuality = RTCQualityNTP;
+    } else if (access("/var/state/dnsmasqsec", F_OK) == 0) {
+        // OpenWrt marks the system time as valid after successful NTP synchronization.
         ourQuality = RTCQualityNTP;
     }
 #endif
@@ -941,9 +949,6 @@ void setup()
 #ifdef ARCH_NRF52
     nrf52Setup();
 #endif
-#ifdef ARCH_NRF54L15
-    nrf54l15Setup();
-#endif
 
 #ifdef ARCH_RP2040
     rp2040Setup();
@@ -972,18 +977,10 @@ void setup()
 
     router = new ReliableRouter();
 
-    // only play start melody when role is not tracker or sensor
-    if (config.power.is_power_saving == true &&
-        IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_TRACKER,
-                  meshtastic_Config_DeviceConfig_Role_TAK_TRACKER, meshtastic_Config_DeviceConfig_Role_SENSOR))
-        LOG_DEBUG("Tracker/Sensor: Skip start melody");
-    else
-        playStartMelody();
-
 #if HAS_SCREEN
-        // fixed screen override?
-        // The geometry picks below are skipped on variants that pin the panel size with
-        // OLED_GEOMETRY_OVERRIDE (see the end of this block) - there they would only be dead stores.
+    // fixed screen override?
+    // The geometry picks below are skipped on variants that pin the panel size with
+    // OLED_GEOMETRY_OVERRIDE (see the end of this block) - there they would only be dead stores.
 #if defined(USE_SH1107)
     screen_model = meshtastic_Config_DisplayConfig_OledType_OLED_SH1107; // set dimension of 128x128
 #ifndef OLED_GEOMETRY_OVERRIDE
@@ -1084,7 +1081,7 @@ void setup()
     SPI.begin();
 #endif
 #else
-        // ESP32
+    // ESP32
 #if defined(HW_SPI1_DEVICE)
     SPI1.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
     LOG_DEBUG("SPI1.begin(SCK=%d, MISO=%d, MOSI=%d, NSS=%d)", LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
@@ -1197,9 +1194,20 @@ void setup()
     osk_found = true;
 #endif
 #endif
+#if ARCH_PORTDUINO && defined(__linux__)
+    // Same idea for a gamepad: it can drive the on-screen keyboard but cannot type, so without a
+    // configured keyboard device it is the only way to compose freetext on this host.
+    if (portduino_config.joystickDevice != "" && portduino_config.keyboardDevice == "") {
+        osk_found = true;
+    }
+#endif
 
     // Now that the mesh service is created, create any modules
     setupModules();
+
+#if !MESHTASTIC_EXCLUDE_WAYPOINT
+    waypointStore.loadFromFlash();
+#endif
 
 #if !MESHTASTIC_EXCLUDE_I2C
     // Inform modules about I2C devices
@@ -1276,6 +1284,15 @@ void setup()
 
     lateInitVariant(); // Do board specific init (see extra_variants/README.md for documentation)
 
+    // Must follow lateInitVariant(): on I2S boards audioThread and the codec are only up by this point.
+    // Skipped for power-saving tracker/sensor roles.
+    if (config.power.is_power_saving == true &&
+        IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_TRACKER,
+                  meshtastic_Config_DeviceConfig_Role_TAK_TRACKER, meshtastic_Config_DeviceConfig_Role_SENSOR))
+        LOG_DEBUG("Tracker/Sensor: Skip start melody");
+    else
+        playStartMelody();
+
 #if !MESHTASTIC_EXCLUDE_MQTT
     mqttInit();
 #endif
@@ -1289,7 +1306,7 @@ void setup()
 
 #ifndef ARCH_PORTDUINO
 
-        // Initialize Wifi
+    // Initialize Wifi
 #if HAS_WIFI
     initWifi();
 #endif
@@ -1313,6 +1330,9 @@ void setup()
     }
 #endif
     initApiServer(TCPPort);
+#ifndef ARCH_PORTDUINO_WASM
+    startNativeDiscovery(TCPPort);
+#endif
 #endif
 
     // Start airtime logger thread.
@@ -1375,6 +1395,9 @@ void setup()
 uint32_t rebootAtMsec;     // If not zero we will reboot at this time (used to reboot shortly after the update completes)
 uint32_t shutdownAtMsec;   // If not zero we will shutdown at this time (used to shutdown from python or mobile client)
 bool suppressRebootBanner; // If true, suppress "Rebooting..." overlay (used for OTA handoff)
+#ifdef ARCH_STM32
+uint32_t enterDfuAtMsec; // If not zero, enter DFU mode at this millis() deadline (see main.h)
+#endif
 
 #if defined(MESHTASTIC_ENCRYPTED_STORAGE) && defined(MESHTASTIC_PHONEAPI_ACCESS_CONTROL)
 volatile bool lockdownReloadPending;  // see main.h - deferred NodeDB reload after lockdown unlock
@@ -1433,8 +1456,9 @@ extern meshtastic_DeviceMetadata getDeviceMetadata()
 
 // No bluetooth on these targets (yet):
 // Pico W / 2W may get it at some point
-// Portduino and ESP32-C6 are excluded because we don't have a working bluetooth stacks integrated yet.
-#if defined(ARCH_RP2040) || defined(ARCH_PORTDUINO) || defined(ARCH_STM32) || defined(CONFIG_IDF_TARGET_ESP32C6)
+// ESP32-C6 is excluded because we don't have a working bluetooth stack integrated yet.
+// Portduino only has BLE when built against BlueZ/sdbus-c++, so it falls out via !HAS_BLUETOOTH.
+#if defined(ARCH_RP2040) || defined(ARCH_STM32) || defined(CONFIG_IDF_TARGET_ESP32C6) || !HAS_BLUETOOTH
     deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_BLUETOOTH_CONFIG;
 #endif
 
@@ -1466,6 +1490,43 @@ void scannerToSensorsMap(const std::unique_ptr<ScanI2CTwoWire> &i2cScanner, Scan
 #endif
 
 #ifndef PIO_UNIT_TESTING
+// Diagnostic (MT-SW): watches for the monotonic uptime carry jumping by roughly one 2^32ms wrap
+// (~49.7 days) between consecutive loop() iterations - the "double-counted wrap" failure mode
+// documented on Time::serviceMonotonic() in UptimeClock.cpp ("Two concurrent callers could count
+// one wrap twice"). Gated on snifferEnabled because the jump has only been observed with the
+// sniffer active and must stay silent with it off. Read-only: never touches the published clock,
+// only logs loudly enough to correlate against other logs the next time it happens.
+static void checkSnifferUptimeJumpDiagnostic()
+{
+    static uint32_t lastLoopMs = 0;
+    static uint32_t lastUptimeSecs = 0;
+    static bool haveBaseline = false;
+
+    if (!snifferEnabled) {
+        haveBaseline = false; // don't let a stale baseline span a sniffer-off gap
+        return;
+    }
+
+    const uint32_t nowLoopMs = Time::getMillis();
+    const uint32_t nowUptimeSecs = Time::getUptimeSecs();
+    if (haveBaseline) {
+        const uint32_t loopDeltaMs = nowLoopMs - lastLoopMs;             // wrap-safe (unsigned, <49.7 days apart)
+        const uint32_t uptimeDeltaSecs = nowUptimeSecs - lastUptimeSecs; // wrap-safe, same reasoning
+        // loop() iterations are milliseconds apart in practice; a few seconds of slack absorbs any
+        // legitimate stall (flash write, screen redraw) without masking a ~49.7-day (4294967s) jump.
+        const uint32_t plausibleSecs = (loopDeltaMs / 1000) + 30;
+        if (uptimeDeltaSecs > plausibleSecs) {
+            LOG_ERROR("Sniffer-diag: uptime jumped %us across one loop() iteration (loop gap only "
+                      "%ums, was=%us now=%us) - suspected monotonic-wrap double-count, see "
+                      "Time::serviceMonotonic() in UptimeClock.cpp",
+                      uptimeDeltaSecs, loopDeltaMs, lastUptimeSecs, nowUptimeSecs);
+        }
+    }
+    lastLoopMs = nowLoopMs;
+    lastUptimeSecs = nowUptimeSecs;
+    haveBaseline = true;
+}
+
 void loop()
 {
     startBusy();
@@ -1473,6 +1534,7 @@ void loop()
 
     // The single writer of the monotonic wrap carry; every other caller only reads it.
     Time::serviceMonotonic();
+    checkSnifferUptimeJumpDiagnostic();
 
 #if defined(MESHTASTIC_ENCRYPTED_STORAGE) && defined(MESHTASTIC_PHONEAPI_ACCESS_CONTROL)
     if (lockdownDisablePending) {
@@ -1481,7 +1543,7 @@ void loop()
         if (nodeDB->disableLockdownToPlaintext()) {
             LOG_INFO("Lockdown: disabled, reboot to normal mode");
             PhoneAPI::broadcastLockdownStatus(meshtastic_LockdownStatus_State_DISABLED, "", 0, 0, 0);
-            rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+            rebootAtMsec = Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 1000);
         } else {
             // Revert failed mid-way (a file couldn't be decrypted/rewritten).
             // The DEK file is still present (it's deleted last), so the device
@@ -1535,7 +1597,7 @@ void loop()
                 EncryptedStorage::lockNow();
                 PhoneAPI::revokeAllAuth();
                 PhoneAPI::broadcastLockdownStatus(meshtastic_LockdownStatus_State_LOCKED, "session_budget_exhausted", 0, 0, 0);
-                rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+                rebootAtMsec = Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 1000);
             } else {
                 uint8_t newBoots = EncryptedStorage::consumeSessionBoot();
                 LOG_WARN("Lockdown: session expired, next budget slot (boots=%u left)", newBoots);
@@ -1559,13 +1621,11 @@ void loop()
 #ifdef ARCH_NRF52
     nrf52Loop();
 #endif
-#ifdef ARCH_NRF54L15
-    nrf54l15Loop();
-#endif
 #ifdef ARCH_RP2040
     rp2040Loop();
 #endif
     power->powerCommandsCheck();
+    nodeDB->saveNodeDatabaseIfDirty();
 
     if (RadioLibInterface::instance != nullptr) {
         static uint32_t lastRadioMissedIrqPoll;
@@ -1574,11 +1634,11 @@ void loop()
             RadioLibInterface::instance->pollMissedIrqs();
         }
 
-        // Periodic AGC reset - warm sleep + recalibrate to prevent stuck AGC gain
+        // Periodic radio upkeep - re-arms RX if it was left off, else an AGC reset when one is due (stuck-gain prevention)
         static uint32_t lastAgcReset;
         if (!Throttle::isWithinTimespanMs(lastAgcReset, AGC_RESET_INTERVAL_MS)) {
             lastAgcReset = millis();
-            RadioLibInterface::instance->resetAGC();
+            RadioLibInterface::instance->periodicRadioMaintenance();
         }
     }
 
@@ -1625,10 +1685,12 @@ void loop()
             if (screen) {
                 screen->showSimpleBanner("Rebooting...");
             }
-            rebootAtMsec = millis() + 25;
+            rebootAtMsec = Time::timerEndsAtMillis(25);
         }
     }
-#if HAS_TFT
+    // The SDL window behind `Display: Panel: X11` gets its events and frames only from this
+    // call, so it has to run in BaseUI-only builds (native-windows-tft) too, not just MUI ones.
+#if HAS_SCREEN
     if (screen && portduino_config.displayPanel == x11 &&
         config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         auto dispdev = screen->getDisplayDevice();
@@ -1639,6 +1701,12 @@ void loop()
 #endif
 #if (HAS_SCREEN || defined(MESHTASTIC_INCLUDE_NICHE_GRAPHICS)) && ENABLE_MESSAGE_PERSISTENCE
     messageStoreAutosaveTick();
+#endif
+#if !MESHTASTIC_EXCLUDE_WAYPOINT
+    waypointStore.purgeExpired();
+#endif
+#if !MESHTASTIC_EXCLUDE_WAYPOINT && ENABLE_WAYPOINT_PERSISTENCE
+    waypointStoreAutosaveTick();
 #endif
     long delayMsec = mainController.runOrDelay();
     endBusy();
@@ -1659,12 +1727,13 @@ void loop()
         mainDelay.delay(delayMsec);
 #endif
     }
-    uint32_t nowMs = millis();
+	 uint32_t nowMs = millis();
     if (!initialized) {
         initialized = true;
         lastCheckMs = nowMs;
         lastBusyUs  = getTotalBusyTimeUs();
     }
+
     if (nowMs - lastCheckMs >= 1000) {
         lastCheckMs = nowMs;
         updateCpuUsageStats();

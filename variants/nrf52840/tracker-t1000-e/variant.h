@@ -105,7 +105,6 @@ extern "C" {
 #define LR11X0_DIO_AS_RF_SWITCH
 
 #define HAS_GPS 1
-#define GNSS_AIROHA
 #define GPS_RX_PIN PIN_SERIAL1_RX
 #define GPS_TX_PIN PIN_SERIAL1_TX
 
@@ -141,7 +140,7 @@ extern "C" {
 #define AREF_VOLTAGE 3.0
 #define VBAT_AR_INTERNAL AR_INTERNAL_3_0
 
-#define OCV_ARRAY 4190, 4042, 3957, 3885, 3820, 3776, 3746, 3725, 3696, 3644, 3100
+#define OCV_ARRAY 4200, 3986, 3922, 3812, 3734, 3645, 3527, 3420, 3281, 3087, 2786
 
 // Buzzer
 #define BUZZER_EN_PIN (32 + 5) // P1.05, always high

@@ -1,3 +1,4 @@
+#include "UptimeClock.h"
 #include "configuration.h"
 
 #if HAS_TELEMETRY && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
@@ -5,6 +6,7 @@
 #include "../mesh/generated/meshtastic/telemetry.pb.h"
 #include "Default.h"
 #include "EnvironmentTelemetry.h"
+#include "GPSStatus.h"
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "Power.h"
@@ -416,8 +418,8 @@ int32_t EnvironmentTelemetryModule::runOnce()
                 result = ina3221Sensor.runOnce();
             if (max17048Sensor.hasSensor())
                 result = max17048Sensor.runOnce();
-                // this only works on the wismesh hub with the solar option. This is not an I2C sensor, so we don't need the
-                // sensormap here.
+            // this only works on the wismesh hub with the solar option. This is not an I2C sensor, so we don't need the
+            // sensormap here.
 #ifdef HAS_RAKPROT
             if (rak9154Sensor.hasSensor())
                 result = rak9154Sensor.runOnce();
@@ -466,7 +468,7 @@ int32_t EnvironmentTelemetryModule::runOnce()
             // Just send to phone when it's not our time to send to mesh yet
             // Only send while queue is empty (phone assumed connected)
             sendTelemetry(NODENUM_BROADCAST, true);
-            lastSentToPhone = millis();
+            lastSentToPhone = Time::skipZero(Time::getMillis());
         }
     }
     if (sleepOnNextExecution) {
@@ -702,7 +704,7 @@ bool EnvironmentTelemetryModule::getEnvironmentTelemetry(meshtastic_Telemetry *m
     // getMetrics() doesn't always get evaluated because of
     // short-circuit evaluation rules in c++
     bool get_metrics;
-    m->time = getTime();
+    m->time = getValidTime(RTCQualityFromNet); // 0 (field omitted) until the clock is set, never a boot-relative 1970 time
     m->which_variant = meshtastic_Telemetry_environment_metrics_tag;
     m->variant.environment_metrics = meshtastic_EnvironmentMetrics_init_zero;
 
@@ -710,6 +712,16 @@ bool EnvironmentTelemetryModule::getEnvironmentTelemetry(meshtastic_Telemetry *m
         get_metrics = sensor->getMetrics(m); // avoid short-circuit evaluation rules
         valid = valid || get_metrics;
         hasSensor = true;
+    }
+
+    // Reduce the raw station pressure to an equivalent sea-level value when we actually know our
+    // altitude (fixed position with an altitude set, or a current GPS fix). Otherwise leave the
+    // sensor's raw reading untouched, as before.
+    if (m->variant.environment_metrics.has_barometric_pressure && gpsStatus && gpsStatus->hasValidAltitude()) {
+        const float referenceTempC =
+            m->variant.environment_metrics.has_temperature ? m->variant.environment_metrics.temperature : 15.0f;
+        m->variant.environment_metrics.barometric_pressure = UnitConversions::PressureAtSeaLevel(
+            m->variant.environment_metrics.barometric_pressure, referenceTempC, gpsStatus->getAltitude());
     }
 
 #ifndef T1000X_SENSOR_EN
@@ -780,7 +792,7 @@ bool EnvironmentTelemetryModule::sendTelemetry(NodeNum dest, bool phoneOnly)
 {
     meshtastic_Telemetry m = meshtastic_Telemetry_init_zero;
     m.which_variant = meshtastic_Telemetry_environment_metrics_tag;
-    m.time = getTime();
+    m.time = getValidTime(RTCQualityFromNet);
 
     bool validTelemetry = getEnvironmentTelemetry(&m);
 

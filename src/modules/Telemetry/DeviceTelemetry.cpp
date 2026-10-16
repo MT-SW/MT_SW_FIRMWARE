@@ -18,6 +18,9 @@
 #include <meshUtils.h>
 #include "FSCommon.h"
 #include "SPILock.h"
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+#include "mesh/wifi/WiFiAPClient.h"
+#endif
 
 #define MAGIC_USB_BATTERY_LEVEL 101
 static constexpr uint16_t TX_HISTORY_KEY_DEVICE_TELEMETRY = 0x8001;
@@ -45,7 +48,7 @@ int32_t DeviceTelemetryModule::runOnce()
         sendTelemetry(NODENUM_BROADCAST, true);
         if (lastSentStatsToPhone == 0 || Throttle::hasElapsed(lastSentStatsToPhone, sendStatsToPhoneIntervalMs)) {
             sendLocalStatsToPhone();
-            lastSentStatsToPhone = Time::getMillis();
+            lastSentStatsToPhone = Time::skipZero(Time::getMillis());
         }
     }
     return sendToPhoneIntervalMs;
@@ -100,7 +103,7 @@ meshtastic_Telemetry DeviceTelemetryModule::getDeviceTelemetry()
 {
     meshtastic_Telemetry t = meshtastic_Telemetry_init_zero;
     t.which_variant = meshtastic_Telemetry_device_metrics_tag;
-    t.time = getTime();
+    t.time = getValidTime(RTCQualityFromNet); // 0 (field omitted) until the clock is set, never a boot-relative 1970 time
     t.variant.device_metrics = meshtastic_DeviceMetrics_init_zero;
     t.variant.device_metrics.has_air_util_tx = true;
     t.variant.device_metrics.has_battery_level = true;
@@ -128,7 +131,7 @@ meshtastic_Telemetry DeviceTelemetryModule::getLocalStatsTelemetry()
     meshtastic_Telemetry telemetry = meshtastic_Telemetry_init_zero;
     telemetry.which_variant = meshtastic_Telemetry_local_stats_tag;
     telemetry.variant.local_stats = meshtastic_LocalStats_init_zero;
-    telemetry.time = getTime();
+    telemetry.time = getValidTime(RTCQualityFromNet);
     telemetry.variant.local_stats.uptime_seconds = Time::getUptimeSecs();
     telemetry.variant.local_stats.channel_utilization = airTime->channelUtilizationPercent();
     telemetry.variant.local_stats.air_util_tx = airTime->utilizationTXPercent();
@@ -179,7 +182,7 @@ meshtastic_Telemetry DeviceTelemetryModule::getLocalStatsExtendedTelemetry()
     meshtastic_Telemetry telemetry = meshtastic_Telemetry_init_zero;
     telemetry.which_variant = meshtastic_Telemetry_local_stats_extended_tag;
     telemetry.variant.local_stats_extended = meshtastic_LocalStatsExtended_init_zero;
-    telemetry.time = getTime();
+    telemetry.time = getValidTime(RTCQualityFromNet);
 
     #if defined(ARCH_ESP32)
         telemetry.variant.local_stats_extended.memory_free_cheap = memGet.getFreeHeap();
@@ -204,13 +207,25 @@ meshtastic_Telemetry DeviceTelemetryModule::getLocalStatsExtendedTelemetry()
 
     telemetry.variant.local_stats_extended.cpu_usage_percent = CpuHwUsagePercent;
 
-    LOG_INFO("local stats extended: memory_free=%i, total_memory=%i, cpu=%i, flash_used=%i, flash_total=%i",
-            telemetry.variant.local_stats_extended.memory_free_cheap, telemetry.variant.local_stats_extended.memory_total, CpuHwUsagePercent,
-            telemetry.variant.local_stats_extended.flash_used_bytes, telemetry.variant.local_stats_extended.flash_total_bytes);
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    // Left at 0 (not sent) when we're not a connected station - SoftAP-only or still associating.
+    if (WiFi.status() == WL_CONNECTED)
+        telemetry.variant.local_stats_extended.wifi_rssi = WiFi.RSSI();
+#endif
+#if HAS_WIFI && defined(ARCH_ESP32)
+    telemetry.variant.local_stats_extended.wifi_drops = getWifiDropCount();
+    telemetry.variant.local_stats_extended.wifi_drop_reason = getWifiDropReason();
+#endif
+
+    LOG_INFO("local stats extended: memory_free=%i, total_memory=%i, cpu=%i, flash_used=%i, flash_total=%i, wifi_rssi=%i, "
+             "wifi_drops=%u, wifi_drop_reason=%u",
+             telemetry.variant.local_stats_extended.memory_free_cheap, telemetry.variant.local_stats_extended.memory_total,
+             CpuHwUsagePercent, telemetry.variant.local_stats_extended.flash_used_bytes,
+             telemetry.variant.local_stats_extended.flash_total_bytes, telemetry.variant.local_stats_extended.wifi_rssi,
+             telemetry.variant.local_stats_extended.wifi_drops, telemetry.variant.local_stats_extended.wifi_drop_reason);
 
     return telemetry;
 }
-
 
 
 

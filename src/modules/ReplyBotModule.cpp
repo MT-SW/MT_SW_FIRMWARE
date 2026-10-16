@@ -131,7 +131,7 @@ ProcessMessage ReplyBotModule::handleReceived(const meshtastic_MeshPacket &mp)
         replyLabel = "Działa, je\xc5\x9bli chcesz lepiej przetestowa\xc4\x87 \xc5\x82ączno\xc5\x9b\xc4\x87, wprowad\xc5\xba komend\xc4\x99 scyzoryk pomoc";
         includeDiagnostics = false;
     } else if (strncmp(cmdStart, "/hello", 6) == 0) {
-        replyLabel = "Witaj w \xc5\x9awi\xc4\x99tokrzyskim! Zapraszam do odwiedzenia strony https://mt-sw.pl";
+        replyLabel = "Witaj w \xc5\x9awi\xc4\x99tokrzyskim! Zapraszam do odwiedzenia strony https://meshtastic-swietokrzyskie.pl";
         includeDiagnostics = false;
     } else {
         replyLabel = "OK"; // nie powinno się zdarzyć - isCommand() już odfiltrował

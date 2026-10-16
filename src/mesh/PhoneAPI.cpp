@@ -22,6 +22,7 @@
 #include "Router.h"
 #include "SPILock.h"
 #include "TypeConversions.h"
+#include "UptimeClock.h"
 #include "concurrency/LockGuard.h"
 #include "main.h"
 #include "modules/NodeInfoModule.h"
@@ -39,6 +40,12 @@
 #endif
 #include "Throttle.h"
 #include "gps/RTC.h"
+#include <algorithm>
+
+// Fork: satellite-DB kinds replayed after config_complete_id - bit 0 position, 1 device telemetry, 2 environment, 3 status.
+#ifndef USERPREFS_PHONEAPI_REPLAY_TYPES
+#define USERPREFS_PHONEAPI_REPLAY_TYPES 0xF
+#endif
 
 namespace
 {
@@ -244,7 +251,7 @@ static void clearAuthSlot_LH(const PhoneAPI *p)
 
 PhoneAPI::PhoneAPI()
 {
-    lastContactMsec = millis();
+    lastContactMsec = Time::skipZero(Time::getMillis());
     std::fill(std::begin(recentToRadioPacketIds), std::end(recentToRadioPacketIds), 0);
 }
 
@@ -436,7 +443,7 @@ bool PhoneAPI::checkConnectionTimeout()
 bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
 {
     powerFSM.trigger(EVENT_CONTACT_FROM_PHONE); // As long as the phone keeps talking to us, don't let the radio go to sleep
-    lastContactMsec = millis();
+    lastContactMsec = Time::skipZero(Time::getMillis());
 
     memset(&toRadioScratch, 0, sizeof(toRadioScratch));
     if (pb_decode_from_bytes(buf, bufLength, &meshtastic_ToRadio_msg, &toRadioScratch)) {
@@ -920,9 +927,9 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
 #ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
             if (!getAdminAuthorized()) {
                 // Unauthenticated: emit an empty MeshBeaconConfig (zero-init from
-                // the top-of-loop memset). The embedded ChannelSettings
-                // (broadcast_offer_channel / broadcast_on_channel) carry PSKs that
-                // must not be visible to an unauth client.
+                // the top-of-loop memset). The embedded broadcast_offer_channel
+                // ChannelSettings carries a PSK that must not be visible to an
+                // unauth client.
             } else
 #endif
             {
@@ -1118,7 +1125,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
 void PhoneAPI::sendConfigComplete()
 {
     LOG_INFO("Config Send Complete millis=%u", millis());
-    const bool shouldReplaySatellites = (config_nonce != SPECIAL_NONCE_ONLY_CONFIG);
+    const bool shouldReplaySatellites = (config_nonce != SPECIAL_NONCE_ONLY_CONFIG) && USERPREFS_PHONEAPI_REPLAY_TYPES != 0;
     // The phone sees config_complete_id first (treats sync as done), then the cached
     // satellite-DB packets (positions / telemetry / environment / status) trickle in
     // afterward as ordinary mesh packets (except SPECIAL_NONCE_ONLY_CONFIG, which
@@ -1172,6 +1179,9 @@ void PhoneAPI::sendConfigComplete()
     onConfigComplete();
 
     pauseBluetoothLogging = false;
+
+    // Re-arm polling for anything queued while live-packet notifications were suppressed during sync.
+    service->nudgeFromNum();
 }
 
 void PhoneAPI::releasePhonePacket()
@@ -1268,6 +1278,31 @@ bool lastHeardIsWallClock(const meshtastic_NodeInfoLite *header)
     return header && header->last_heard >= MIN_PLAUSIBLE_EPOCH;
 }
 
+constexpr uint32_t REPLAY_TYPE_POSITION = 1u << 0;
+constexpr uint32_t REPLAY_TYPE_TELEMETRY = 1u << 1;
+constexpr uint32_t REPLAY_TYPE_ENVIRONMENT = 1u << 2;
+constexpr uint32_t REPLAY_TYPE_STATUS = 1u << 3;
+
+/// Fork: empty the snapshot when its kind is masked out of USERPREFS_PHONEAPI_REPLAY_TYPES, and drop nodes not heard within
+/// USERPREFS_PHONEAPI_REPLAY_MAX_AGE_SECS - including any whose age is unprovable (no wall clock here or in last_heard).
+[[maybe_unused]] void filterReplayOrder(std::vector<uint32_t> &order, uint32_t type)
+{
+    if (!(USERPREFS_PHONEAPI_REPLAY_TYPES & type)) {
+        order.clear();
+        return;
+    }
+#ifdef USERPREFS_PHONEAPI_REPLAY_MAX_AGE_SECS
+    const uint32_t now = getValidTime(RTCQualityFromNet);
+    auto isStale = [now](uint32_t num) {
+        const meshtastic_NodeInfoLite *header = nodeDB->getMeshNode(num);
+        if (now < MIN_PLAUSIBLE_EPOCH || !lastHeardIsWallClock(header))
+            return true;
+        return now > header->last_heard && now - header->last_heard > (uint32_t)USERPREFS_PHONEAPI_REPLAY_MAX_AGE_SECS;
+    };
+    order.erase(std::remove_if(order.begin(), order.end(), isStale), order.end());
+#endif
+}
+
 } // namespace
 
 // Replayed packets deliberately leave rx_rssi absent. NodeInfoLite stores no RSSI, and
@@ -1353,6 +1388,7 @@ void PhoneAPI::beginReplayPositions()
     // map don't invalidate iteration. Skip our own node - the phone already
     // got our position bundled in STATE_SEND_OWN_NODEINFO.
     replayPositionOrder = nodeDB->snapshotPositionNodeNums(nodeDB->getNodeNum());
+    filterReplayOrder(replayPositionOrder, REPLAY_TYPE_POSITION);
     replayPositionIndex = 0;
     LOG_INFO("Begin position replay: %u entries millis=%u", (unsigned)replayPositionOrder.size(), millis());
 #endif
@@ -1389,6 +1425,7 @@ void PhoneAPI::beginReplayTelemetry()
     replayTelemetryIndex = 0;
 #else
     replayTelemetryOrder = nodeDB->snapshotTelemetryNodeNums(nodeDB->getNodeNum());
+    filterReplayOrder(replayTelemetryOrder, REPLAY_TYPE_TELEMETRY);
     replayTelemetryIndex = 0;
     LOG_INFO("Begin telemetry replay: %u entries millis=%u", (unsigned)replayTelemetryOrder.size(), millis());
 #endif
@@ -1455,6 +1492,7 @@ void PhoneAPI::beginReplayEnvironment()
     replayEnvironmentIndex = 0;
 #else
     replayEnvironmentOrder = nodeDB->snapshotEnvironmentNodeNums(nodeDB->getNodeNum());
+    filterReplayOrder(replayEnvironmentOrder, REPLAY_TYPE_ENVIRONMENT);
     replayEnvironmentIndex = 0;
     LOG_INFO("Begin environment replay: %u entries millis=%u", (unsigned)replayEnvironmentOrder.size(), millis());
 #endif
@@ -1517,6 +1555,7 @@ void PhoneAPI::beginReplayStatus()
     replayStatusIndex = 0;
 #else
     replayStatusOrder = nodeDB->snapshotStatusNodeNums(nodeDB->getNodeNum());
+    filterReplayOrder(replayStatusOrder, REPLAY_TYPE_STATUS);
     replayStatusIndex = 0;
     LOG_INFO("Begin status replay: %u entries millis=%u", (unsigned)replayStatusOrder.size(), millis());
 #endif
@@ -1851,7 +1890,7 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
     if (p.decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP && lastPortNumToRadio[p.decoded.portnum] &&
         Throttle::isWithinTimespanMs(lastPortNumToRadio[p.decoded.portnum], TEN_SECONDS_MS)) {
         LOG_WARN("Rate limit portnum %d", p.decoded.portnum);
-        sendNotification(meshtastic_LogRecord_Level_WARNING, p.id, "Wyznaczanie trasy można wywoływać najczęściej co 10 sekund!");
+        sendNotification(meshtastic_LogRecord_Level_WARNING, p.id, "Wyznaczanaie trasy można wywolywac najczesciej co 10 sekund!");
         meshtastic_QueueStatus qs = router->getQueueStatus();
         service->sendQueueStatusToPhone(qs, 0, p.id);
         return false;
@@ -2080,7 +2119,7 @@ bool PhoneAPI::handleLockdownAuthInline(const meshtastic_LockdownAuth &la)
         revokeAllAuth();
         queueLockdownStatus(meshtastic_LockdownStatus_State_LOCKED, "", 0, 0, 0);
         zeroPassphrase();
-        rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+        rebootAtMsec = Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 1000);
         return true;
     }
 

@@ -1,8 +1,8 @@
 #pragma once
 
 #include "FloodingRouter.h"
+#include <map>
 #include <optional>
-#include <unordered_map>
 
 /**
  * An identifier for a globally unique message - a pair of the sending nodenum and the packet id assigned
@@ -13,6 +13,7 @@ struct GlobalPacketId {
     PacketId id;
 
     bool operator==(const GlobalPacketId &p) const { return node == p.node && id == p.id; }
+    bool operator<(const GlobalPacketId &p) const { return node != p.node ? node < p.node : id < p.id; }
 
     explicit GlobalPacketId(const meshtastic_MeshPacket *p)
     {
@@ -67,12 +68,6 @@ struct RouteHealth {
 #ifndef NEXTHOP_EARLY_FLOOD_ON_UNVERIFIED
 #define NEXTHOP_EARLY_FLOOD_ON_UNVERIFIED 0
 #endif
-
-class GlobalPacketIdHashFunction
-{
-  public:
-    size_t operator()(const GlobalPacketId &p) const { return (std::hash<NodeNum>()(p.node)) ^ (std::hash<PacketId>()(p.id)); }
-};
 
 /*
   Router for direct messages, which only relays if it is the next hop for a packet. The next hop is set by the current
@@ -130,7 +125,7 @@ class NextHopRouter : public FloodingRouter
     /**
      * Pending retransmissions
      */
-    std::unordered_map<GlobalPacketId, PendingPacket, GlobalPacketIdHashFunction> pending;
+    std::map<GlobalPacketId, PendingPacket> pending; // std::map keeps the libstdc++ hashtable out of small images
 
     /**
      * Per-destination route health (M3). Bounded array, reuse-oldest eviction. RAM-only.
@@ -151,6 +146,9 @@ class NextHopRouter : public FloodingRouter
     };
     OpaqueSeen opaqueSeen[OPAQUE_SEEN_MAX] = {};
     uint8_t opaqueSeenNext = 0; // ring write cursor (round-robin eviction)
+    // Bit i: slot i's frame arrived over LoRa at least once, not only over UDP/MQTT (see isOriginatorRetransmission)
+    uint32_t opaqueHeardOverLora = 0;
+    static_assert(OPAQUE_SEEN_MAX <= 32, "opaqueHeardOverLora holds one bit per opaqueSeen slot");
 
     /**
      * Should this incoming filter be dropped?
@@ -161,8 +159,9 @@ class NextHopRouter : public FloodingRouter
     virtual bool shouldFilterReceived(const meshtastic_MeshPacket *p) override;
     bool relayOpaquePacket(const meshtastic_MeshPacket *p) override;
     // Dedup helper for relayOpaquePacket: true if (from,id) is already recorded; otherwise records it
-    // (round-robin eviction) and returns false. Pure function of the table - no clock.
-    bool opaqueWasSeenRecently(NodeNum from, PacketId id);
+    // (round-robin eviction) and returns false. overLora marks the entry as heard over LoRa, and
+    // wasHeardOverLora reports whether an earlier copy already was. Pure function of the table - no clock.
+    bool opaqueWasSeenRecently(NodeNum from, PacketId id, bool overLora = false, bool *wasHeardOverLora = nullptr);
 
     /**
      * Look for packets we need to relay

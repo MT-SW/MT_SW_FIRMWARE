@@ -15,6 +15,9 @@ namespace Time
 // test_uptime_clock/ do exactly that.
 inline std::atomic<uint32_t> testNowMs{0};
 inline std::atomic<bool> useTestClock{false};
+// One-shot glitch: the next getMillis() returns testGlitchMs instead of the test clock, once.
+inline std::atomic<uint32_t> testGlitchMs{0};
+inline std::atomic<bool> testGlitchArmed{false};
 using MonotonicPublishHook = void (*)();
 
 inline void setTestMillis(uint32_t ms)
@@ -27,11 +30,20 @@ inline void advanceTestMillis(uint32_t deltaMs)
     testNowMs.fetch_add(deltaMs, std::memory_order_relaxed);
     useTestClock.store(true, std::memory_order_relaxed);
 }
+// Make the next getMillis() read return ms, as a single glitched hardware read would; later reads
+// see the test clock again.
+inline void glitchNextTestMillis(uint32_t ms)
+{
+    testGlitchMs.store(ms, std::memory_order_relaxed);
+    testGlitchArmed.store(true, std::memory_order_relaxed);
+    useTestClock.store(true, std::memory_order_relaxed);
+}
 // Restore real-clock behaviour (call in test tearDown if a suite mixes real and fake time).
 inline void useRealClock()
 {
     useTestClock.store(false, std::memory_order_relaxed);
     testNowMs.store(0, std::memory_order_relaxed);
+    testGlitchArmed.store(false, std::memory_order_relaxed);
 }
 // Zero the published wrap carry. Suites that assert absolute uptime values call this in setUp():
 // a previous case that moved the test clock backwards left a counted wrap behind.
@@ -44,12 +56,47 @@ void setMonotonicPublishHookForTests(MonotonicPublishHook hook);
 /// which is wrap-correct with no carry state at all.
 uint32_t getMillis();
 
+/// Step a millis value past 0. Stored stamps and deadlines conventionally use 0 for "unset", so the
+/// one tick per ~49.7-day wrap that lands on 0 would read as never-set; 1 is a 1 ms error instead.
+constexpr uint32_t skipZero(uint32_t ms)
+{
+    return ms ? ms : 1;
+}
+
+/// Start a countdown to delayMs from now, never 0. The sum is what has to dodge 0 - a non-zero
+/// read plus a delay lands there once per wrap - so this is not skipZero(getMillis()) + delayMs.
+inline uint32_t timerEndsAtMillis(uint32_t delayMs)
+{
+    return skipZero(getMillis() + delayMs);
+}
+
+/// getMillis() for 0-means-unset stamps, with the 0 tick called 1. Use at the read when the value
+/// is both stored and compared against stamps: skipZero() only at the store makes `now - stamp` wrap.
+inline uint32_t stampMillis()
+{
+    return skipZero(getMillis());
+}
+
+// skipZero() is the whole 0-means-unset contract in one expression, and it is constexpr, so pin it
+// here rather than only in test_uptime_clock: a build that breaks it stops at this header instead of
+// shipping a deadline that reads as never-set. The two obvious "simplifications" are what these
+// catch - `ms | 1` perturbs every even value, and `ms + 1` turns the last tick of the wrap into the
+// 0 the function exists to avoid. Both compile and both pass a test that only checks skipZero(0).
+static_assert(skipZero(0) == 1, "skipZero must lift the one 0 tick to 1");
+static_assert(skipZero(1) == 1, "skipZero must leave 1 alone");
+static_assert(skipZero(2) == 2, "skipZero must pass even values through untouched (ms | 1 would not)");
+static_assert(skipZero(UINT32_MAX) == UINT32_MAX, "skipZero must not wrap the last tick to 0 (ms + 1 would)");
+
 /// Milliseconds since boot as a monotonic 64-bit count.
 ///
 /// A pure read: it derives its answer from a complete snapshot published by serviceMonotonic()
 /// plus the unsigned elapsed time since that snapshot, which is exact across the wrap. A reader
 /// that preempts publication uses the previous snapshot. If publication completes during a copy,
 /// the reader retries; it never waits for a publish in progress.
+///
+/// An elapsed reading past half of the 2^32 range is treated as `now` having ticked backward
+/// (clock-domain jitter, not a genuine near-full wrap) and held at the last published value rather
+/// than folded in - see test_monotonic_ignores_small_backward_tick_of_millis.
 ///
 /// Not intended for ISR call sites because lock-free std::atomic operations are not guaranteed by
 /// every supported toolchain. ISRs use getMillis(); the publication protocol itself never waits.
@@ -61,7 +108,10 @@ uint32_t getUptimeSecs();
 
 /// Advances the published wrap carry. THE ONLY WRITER - call it from the main loop and nowhere
 /// else. Two concurrent callers could count one wrap twice, jumping every uptime and wall-clock
-/// reading ~49.7 days forward for the rest of the boot.
+/// reading ~49.7 days forward for the rest of the boot - so a second call arriving while one is
+/// still in flight is refused (logged, not read) rather than risking a torn snapshot read. That is
+/// a backstop against the failure mode, not a license to call this from a second place: the refused
+/// call still means one fewer tick counted this cycle.
 ///
 /// Must run at least once per ~49.7-day wrap window; the main loop calls it every iteration.
 void serviceMonotonic();

@@ -118,7 +118,7 @@ typedef enum _meshtastic_TelemetrySensorType {
     meshtastic_TelemetrySensorType_DS248X = 51,
     /* MMC5983MA 3-Axis Digital Magnetic Sensor */
     meshtastic_TelemetrySensorType_MMC5983MA = 52,
-    /* ICM-42607-P 6‑Axis IMU */
+    /* ICM-42607-P 6-Axis IMU */
     meshtastic_TelemetrySensorType_ICM42607P = 53,
     /* SPA06 pressure and temperature */
     meshtastic_TelemetrySensorType_SPA06 = 54,
@@ -275,6 +275,59 @@ typedef struct _meshtastic_EnvironmentMetrics {
     bool has_lightning_distance_km;
     float lightning_distance_km;
 } meshtastic_EnvironmentMetrics;
+
+/* Soil and water probe metrics.
+
+ Chemistry reported by soil probes (RS-485/SDI-12 NPK probes) and by
+ water-quality sondes. Split out of EnvironmentMetrics so that message stays
+ within the mesh payload budget. */
+typedef struct _meshtastic_SoilWaterMetrics {
+    /* Soil pH, 0-14 */
+    bool has_soil_ph;
+    float soil_ph;
+    /* pH of water or other solution, 0-14 */
+    bool has_ph;
+    float ph;
+    /* Electrical conductivity in mS/cm */
+    bool has_electrical_conductivity;
+    float electrical_conductivity;
+    /* Salinity in mg/l */
+    bool has_salinity;
+    float salinity;
+    /* Nitrogen concentration in mg/kg */
+    bool has_nitrogen;
+    float nitrogen;
+    /* Phosphorus concentration in mg/kg */
+    bool has_phosphorus;
+    float phosphorus;
+    /* Potassium concentration in mg/kg */
+    bool has_potassium;
+    float potassium;
+    /* Dissolved oxygen in mg/l */
+    bool has_dissolved_oxygen;
+    float dissolved_oxygen;
+    /* Oxidation-reduction potential (ORP) in mV */
+    bool has_orp;
+    float orp;
+    /* Chemical oxygen demand in mg/l */
+    bool has_chemical_oxygen_demand;
+    float chemical_oxygen_demand;
+    /* Turbidity in NTU */
+    bool has_turbidity;
+    float turbidity;
+    /* Nitrate concentration in ppm */
+    bool has_nitrate;
+    float nitrate;
+    /* Ammonium concentration in ppm */
+    bool has_ammonium;
+    float ammonium;
+    /* Biochemical oxygen demand in mg/l */
+    bool has_biochemical_oxygen_demand;
+    float biochemical_oxygen_demand;
+    /* Solar irradiance in W/m^2 (distinct from the radiation field's uR/h) */
+    bool has_solar_irradiance;
+    float solar_irradiance;
+} meshtastic_SoilWaterMetrics;
 
 /* Power Metrics (voltage / current / etc) */
 typedef struct _meshtastic_PowerMetrics {
@@ -450,31 +503,22 @@ typedef struct _meshtastic_LocalStats {
 } meshtastic_LocalStats;
 
 
-
-
-
-/* Local device mesh statistics */ 		 
-typedef struct _meshtastic_LocalStatsExtended {		 
-    /* free cheap memory */ 		 
-    uint32_t memory_free_cheap;		 
-    /* total memory */ 		 
-    uint32_t memory_total;		 
-    /* cpu usage percent */ 		 
-    uint32_t cpu_usage_percent;		 
-    /* free space on flash */ 		 
-    uint32_t flash_used_bytes;		 
-    /* total available space */ 		 
-    uint32_t flash_total_bytes;		 
-    /* psram used */ 		 
-    uint32_t memory_psram_free;		 
-    /* psram total */ 		 
-    uint32_t memory_psram_total;		 
-} meshtastic_LocalStatsExtended;		 
-
-
-
-
-
+/* Extended local device statistics (custom firmware) */
+typedef struct _meshtastic_LocalStatsExtended {
+    uint32_t memory_free_cheap;
+    uint32_t memory_total;
+    uint32_t cpu_usage_percent;
+    uint32_t flash_used_bytes;
+    uint32_t flash_total_bytes;
+    uint32_t memory_psram_free;
+    uint32_t memory_psram_total;
+    /* dBm of the station link to the AP; 0 when Wi-Fi is not connected as a station */
+    int32_t wifi_rssi;
+    /* Established Wi-Fi station links lost since boot; failed (re)connect attempts don't count */
+    uint32_t wifi_drops;
+    /* ESP-IDF wifi_err_reason_t of the most recent drop counted in wifi_drops; 0 if none yet */
+    uint32_t wifi_drop_reason;
+} meshtastic_LocalStatsExtended;
 
 
 
@@ -532,7 +576,7 @@ typedef struct _meshtastic_HostMetrics {
     /* Optional User-provided string for arbitrary host system information
  that doesn't make sense as a dedicated entry. */
     bool has_user_string;
-    char user_string[200];
+    char user_string[161];
 } meshtastic_HostMetrics;
 
 /* Types of Measurements the telemetry module is equipped to handle */
@@ -557,7 +601,10 @@ typedef struct _meshtastic_Telemetry {
         meshtastic_HostMetrics host_metrics;
         /* Traffic management statistics */
         meshtastic_TrafficManagementStats traffic_management_stats;
+		/* Health telemetry metrics */
         meshtastic_LocalStatsExtended local_stats_extended;
+        /* Soil and water probe metrics */
+        meshtastic_SoilWaterMetrics soil_water_metrics;
     } variant;
 } meshtastic_Telemetry;
 
@@ -569,12 +616,12 @@ typedef struct _meshtastic_Nau7802Config {
     float calibrationFactor;
 } meshtastic_Nau7802Config;
 
-/* AS3935 lightning sensor configuration, for saving to flash */
-typedef struct _meshtastic_AS3935Config {
+/* AS3935 lightning sensor state, for saving to flash */
+typedef struct _meshtastic_AS3935State {
     /* Antenna tuning capacitance in pF, 0 to 120 in steps of 8. The chip does not retain
  this across power loss, so it is stored here and re-applied on every boot. */
     uint32_t tuning_cap_pf;
-} meshtastic_AS3935Config;
+} meshtastic_AS3935State;
 
 /* SEN5X State, for saving to flash (to be merged with SEN6XState) */
 typedef struct _meshtastic_SEN5XState {
@@ -638,33 +685,36 @@ extern "C" {
 
 
 
+
 /* Initializer values for message structs */
 #define meshtastic_DeviceMetrics_init_default    {false, 0, false, 0, false, 0, false, 0, false, 0}
 #define meshtastic_EnvironmentMetrics_init_default {false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0}
+#define meshtastic_SoilWaterMetrics_init_default {false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0}
 #define meshtastic_PowerMetrics_init_default     {false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0}
 #define meshtastic_AirQualityMetrics_init_default {false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0}
 #define meshtastic_LocalStats_init_default       {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-#define meshtastic_LocalStatsExtended_init_default {0, 0, 0, 0, 0, 0, 0}
+#define meshtastic_LocalStatsExtended_init_default {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_TrafficManagementStats_init_default {0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_HealthMetrics_init_default    {false, 0, false, 0, false, 0}
 #define meshtastic_HostMetrics_init_default      {0, 0, 0, false, 0, false, 0, 0, 0, 0, false, ""}
 #define meshtastic_Telemetry_init_default        {0, 0, {meshtastic_DeviceMetrics_init_default}}
 #define meshtastic_Nau7802Config_init_default    {0, 0}
-#define meshtastic_AS3935Config_init_default     {0}
+#define meshtastic_AS3935State_init_default      {0}
 #define meshtastic_SEN5XState_init_default       {0, 0, 0, false, 0, false, 0, false, 0}
 #define meshtastic_SEN6XState_init_default       {0, 0, 0, false, 0, false, 0, false, 0}
 #define meshtastic_DeviceMetrics_init_zero       {false, 0, false, 0, false, 0, false, 0, false, 0}
 #define meshtastic_EnvironmentMetrics_init_zero  {false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0}
+#define meshtastic_SoilWaterMetrics_init_zero    {false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0}
 #define meshtastic_PowerMetrics_init_zero        {false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0}
 #define meshtastic_AirQualityMetrics_init_zero   {false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0, false, 0}
 #define meshtastic_LocalStats_init_zero          {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-#define meshtastic_LocalStatsExtended_init_zero  {0, 0, 0, 0, 0, 0, 0}
+#define meshtastic_LocalStatsExtended_init_zero  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_TrafficManagementStats_init_zero {0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_HealthMetrics_init_zero       {false, 0, false, 0, false, 0}
 #define meshtastic_HostMetrics_init_zero         {0, 0, 0, false, 0, false, 0, 0, 0, 0, false, ""}
 #define meshtastic_Telemetry_init_zero           {0, 0, {meshtastic_DeviceMetrics_init_zero}}
 #define meshtastic_Nau7802Config_init_zero       {0, 0}
-#define meshtastic_AS3935Config_init_zero        {0}
+#define meshtastic_AS3935State_init_zero         {0}
 #define meshtastic_SEN5XState_init_zero          {0, 0, 0, false, 0, false, 0, false, 0}
 #define meshtastic_SEN6XState_init_zero          {0, 0, 0, false, 0, false, 0, false, 0}
 
@@ -714,6 +764,21 @@ extern "C" {
 #define meshtastic_EnvironmentMetrics_one_wire_temperature_ch7_tag 39
 #define meshtastic_EnvironmentMetrics_lightning_strike_count_1h_tag 40
 #define meshtastic_EnvironmentMetrics_lightning_distance_km_tag 41
+#define meshtastic_SoilWaterMetrics_soil_ph_tag  1
+#define meshtastic_SoilWaterMetrics_ph_tag       2
+#define meshtastic_SoilWaterMetrics_electrical_conductivity_tag 3
+#define meshtastic_SoilWaterMetrics_salinity_tag 4
+#define meshtastic_SoilWaterMetrics_nitrogen_tag 5
+#define meshtastic_SoilWaterMetrics_phosphorus_tag 6
+#define meshtastic_SoilWaterMetrics_potassium_tag 7
+#define meshtastic_SoilWaterMetrics_dissolved_oxygen_tag 8
+#define meshtastic_SoilWaterMetrics_orp_tag      9
+#define meshtastic_SoilWaterMetrics_chemical_oxygen_demand_tag 10
+#define meshtastic_SoilWaterMetrics_turbidity_tag 11
+#define meshtastic_SoilWaterMetrics_nitrate_tag  12
+#define meshtastic_SoilWaterMetrics_ammonium_tag 13
+#define meshtastic_SoilWaterMetrics_biochemical_oxygen_demand_tag 14
+#define meshtastic_SoilWaterMetrics_solar_irradiance_tag 15
 #define meshtastic_PowerMetrics_ch1_voltage_tag  1
 #define meshtastic_PowerMetrics_ch1_current_tag  2
 #define meshtastic_PowerMetrics_ch2_voltage_tag  3
@@ -771,7 +836,16 @@ extern "C" {
 #define meshtastic_LocalStats_heap_free_bytes_tag 13
 #define meshtastic_LocalStats_num_tx_dropped_tag 14
 #define meshtastic_LocalStats_noise_floor_tag    15
-#define meshtastic_Telemetry_local_stats_extended_tag 20
+#define meshtastic_LocalStatsExtended_memory_free_cheap_tag 1
+#define meshtastic_LocalStatsExtended_memory_total_tag 2
+#define meshtastic_LocalStatsExtended_cpu_usage_percent_tag 3
+#define meshtastic_LocalStatsExtended_flash_used_bytes_tag 4
+#define meshtastic_LocalStatsExtended_flash_total_bytes_tag 5
+#define meshtastic_LocalStatsExtended_memory_psram_free_tag 6
+#define meshtastic_LocalStatsExtended_memory_psram_total_tag 7
+#define meshtastic_LocalStatsExtended_wifi_rssi_tag 8
+#define meshtastic_LocalStatsExtended_wifi_drops_tag 9
+#define meshtastic_LocalStatsExtended_wifi_drop_reason_tag 10
 #define meshtastic_TrafficManagementStats_packets_inspected_tag 1
 #define meshtastic_TrafficManagementStats_position_dedup_drops_tag 2
 #define meshtastic_TrafficManagementStats_nodeinfo_cache_hits_tag 3
@@ -800,9 +874,11 @@ extern "C" {
 #define meshtastic_Telemetry_health_metrics_tag  7
 #define meshtastic_Telemetry_host_metrics_tag    8
 #define meshtastic_Telemetry_traffic_management_stats_tag 9
+#define meshtastic_Telemetry_soil_water_metrics_tag 11
+#define meshtastic_Telemetry_local_stats_extended_tag 20
 #define meshtastic_Nau7802Config_zeroOffset_tag  1
 #define meshtastic_Nau7802Config_calibrationFactor_tag 2
-#define meshtastic_AS3935Config_tuning_cap_pf_tag 1
+#define meshtastic_AS3935State_tuning_cap_pf_tag 1
 #define meshtastic_SEN5XState_last_cleaning_time_tag 1
 #define meshtastic_SEN5XState_last_cleaning_valid_tag 2
 #define meshtastic_SEN5XState_one_shot_mode_tag  3
@@ -869,6 +945,25 @@ X(a, STATIC,   OPTIONAL, UINT32,   lightning_strike_count_1h,  40) \
 X(a, STATIC,   OPTIONAL, FLOAT,    lightning_distance_km,  41)
 #define meshtastic_EnvironmentMetrics_CALLBACK NULL
 #define meshtastic_EnvironmentMetrics_DEFAULT NULL
+
+#define meshtastic_SoilWaterMetrics_FIELDLIST(X, a) \
+X(a, STATIC,   OPTIONAL, FLOAT,    soil_ph,           1) \
+X(a, STATIC,   OPTIONAL, FLOAT,    ph,                2) \
+X(a, STATIC,   OPTIONAL, FLOAT,    electrical_conductivity,   3) \
+X(a, STATIC,   OPTIONAL, FLOAT,    salinity,          4) \
+X(a, STATIC,   OPTIONAL, FLOAT,    nitrogen,          5) \
+X(a, STATIC,   OPTIONAL, FLOAT,    phosphorus,        6) \
+X(a, STATIC,   OPTIONAL, FLOAT,    potassium,         7) \
+X(a, STATIC,   OPTIONAL, FLOAT,    dissolved_oxygen,   8) \
+X(a, STATIC,   OPTIONAL, FLOAT,    orp,               9) \
+X(a, STATIC,   OPTIONAL, FLOAT,    chemical_oxygen_demand,  10) \
+X(a, STATIC,   OPTIONAL, FLOAT,    turbidity,        11) \
+X(a, STATIC,   OPTIONAL, FLOAT,    nitrate,          12) \
+X(a, STATIC,   OPTIONAL, FLOAT,    ammonium,         13) \
+X(a, STATIC,   OPTIONAL, FLOAT,    biochemical_oxygen_demand,  14) \
+X(a, STATIC,   OPTIONAL, FLOAT,    solar_irradiance,  15)
+#define meshtastic_SoilWaterMetrics_CALLBACK NULL
+#define meshtastic_SoilWaterMetrics_DEFAULT NULL
 
 #define meshtastic_PowerMetrics_FIELDLIST(X, a) \
 X(a, STATIC,   OPTIONAL, FLOAT,    ch1_voltage,       1) \
@@ -945,15 +1040,13 @@ X(a, STATIC,   SINGULAR, UINT32,   memory_total,      2) \
 X(a, STATIC,   SINGULAR, UINT32,   cpu_usage_percent,   3) \
 X(a, STATIC,   SINGULAR, UINT32,   flash_used_bytes,   4) \
 X(a, STATIC,   SINGULAR, UINT32,   flash_total_bytes,   5) \
-X(a, STATIC,   SINGULAR, UINT32,   flash_total_bytes,   5) \
 X(a, STATIC,   SINGULAR, UINT32,   memory_psram_free,   6) \
-X(a, STATIC,   SINGULAR, UINT32,   memory_psram_total,   7)
+X(a, STATIC,   SINGULAR, UINT32,   memory_psram_total,   7) \
+X(a, STATIC,   SINGULAR, INT32,    wifi_rssi,           8) \
+X(a, STATIC,   SINGULAR, UINT32,   wifi_drops,          9) \
+X(a, STATIC,   SINGULAR, UINT32,   wifi_drop_reason,   10)
 #define meshtastic_LocalStatsExtended_CALLBACK NULL
 #define meshtastic_LocalStatsExtended_DEFAULT NULL
-
-
-
-
 
 #define meshtastic_TrafficManagementStats_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   packets_inspected,   1) \
@@ -995,8 +1088,9 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (variant,power_metrics,variant.power_metrics)
 X(a, STATIC,   ONEOF,    MESSAGE,  (variant,local_stats,variant.local_stats),   6) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (variant,health_metrics,variant.health_metrics),   7) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (variant,host_metrics,variant.host_metrics),   8) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (variant,local_stats_extended,variant.local_stats_extended),   20) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (variant,traffic_management_stats,variant.traffic_management_stats),   9)
+X(a, STATIC,   ONEOF,    MESSAGE,  (variant,traffic_management_stats,variant.traffic_management_stats),   9) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (variant,soil_water_metrics,variant.soil_water_metrics),  11)  \
+X(a, STATIC,   ONEOF,    MESSAGE,  (variant,local_stats_extended,variant.local_stats_extended),  20)
 #define meshtastic_Telemetry_CALLBACK NULL
 #define meshtastic_Telemetry_DEFAULT NULL
 #define meshtastic_Telemetry_variant_device_metrics_MSGTYPE meshtastic_DeviceMetrics
@@ -1006,8 +1100,9 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (variant,traffic_management_stats,variant.tra
 #define meshtastic_Telemetry_variant_local_stats_MSGTYPE meshtastic_LocalStats
 #define meshtastic_Telemetry_variant_health_metrics_MSGTYPE meshtastic_HealthMetrics
 #define meshtastic_Telemetry_variant_host_metrics_MSGTYPE meshtastic_HostMetrics
-#define meshtastic_Telemetry_variant_local_stats_extended_MSGTYPE meshtastic_LocalStatsExtended
 #define meshtastic_Telemetry_variant_traffic_management_stats_MSGTYPE meshtastic_TrafficManagementStats
+#define meshtastic_Telemetry_variant_soil_water_metrics_MSGTYPE meshtastic_SoilWaterMetrics
+#define meshtastic_Telemetry_variant_local_stats_extended_MSGTYPE meshtastic_LocalStatsExtended
 
 #define meshtastic_Nau7802Config_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, INT32,    zeroOffset,        1) \
@@ -1015,10 +1110,10 @@ X(a, STATIC,   SINGULAR, FLOAT,    calibrationFactor,   2)
 #define meshtastic_Nau7802Config_CALLBACK NULL
 #define meshtastic_Nau7802Config_DEFAULT NULL
 
-#define meshtastic_AS3935Config_FIELDLIST(X, a) \
+#define meshtastic_AS3935State_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   tuning_cap_pf,     1)
-#define meshtastic_AS3935Config_CALLBACK NULL
-#define meshtastic_AS3935Config_DEFAULT NULL
+#define meshtastic_AS3935State_CALLBACK NULL
+#define meshtastic_AS3935State_DEFAULT NULL
 
 #define meshtastic_SEN5XState_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   last_cleaning_time,   1) \
@@ -1042,6 +1137,7 @@ X(a, STATIC,   OPTIONAL, FIXED64,  voc_state_array,   6)
 
 extern const pb_msgdesc_t meshtastic_DeviceMetrics_msg;
 extern const pb_msgdesc_t meshtastic_EnvironmentMetrics_msg;
+extern const pb_msgdesc_t meshtastic_SoilWaterMetrics_msg;
 extern const pb_msgdesc_t meshtastic_PowerMetrics_msg;
 extern const pb_msgdesc_t meshtastic_AirQualityMetrics_msg;
 extern const pb_msgdesc_t meshtastic_LocalStats_msg;
@@ -1051,13 +1147,14 @@ extern const pb_msgdesc_t meshtastic_HealthMetrics_msg;
 extern const pb_msgdesc_t meshtastic_HostMetrics_msg;
 extern const pb_msgdesc_t meshtastic_Telemetry_msg;
 extern const pb_msgdesc_t meshtastic_Nau7802Config_msg;
-extern const pb_msgdesc_t meshtastic_AS3935Config_msg;
+extern const pb_msgdesc_t meshtastic_AS3935State_msg;
 extern const pb_msgdesc_t meshtastic_SEN5XState_msg;
 extern const pb_msgdesc_t meshtastic_SEN6XState_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
 #define meshtastic_DeviceMetrics_fields &meshtastic_DeviceMetrics_msg
 #define meshtastic_EnvironmentMetrics_fields &meshtastic_EnvironmentMetrics_msg
+#define meshtastic_SoilWaterMetrics_fields &meshtastic_SoilWaterMetrics_msg
 #define meshtastic_PowerMetrics_fields &meshtastic_PowerMetrics_msg
 #define meshtastic_AirQualityMetrics_fields &meshtastic_AirQualityMetrics_msg
 #define meshtastic_LocalStats_fields &meshtastic_LocalStats_msg
@@ -1067,25 +1164,26 @@ extern const pb_msgdesc_t meshtastic_SEN6XState_msg;
 #define meshtastic_HostMetrics_fields &meshtastic_HostMetrics_msg
 #define meshtastic_Telemetry_fields &meshtastic_Telemetry_msg
 #define meshtastic_Nau7802Config_fields &meshtastic_Nau7802Config_msg
-#define meshtastic_AS3935Config_fields &meshtastic_AS3935Config_msg
+#define meshtastic_AS3935State_fields &meshtastic_AS3935State_msg
 #define meshtastic_SEN5XState_fields &meshtastic_SEN5XState_msg
 #define meshtastic_SEN6XState_fields &meshtastic_SEN6XState_msg
 
 /* Maximum encoded size of messages (where known) */
 #define MESHTASTIC_MESHTASTIC_TELEMETRY_PB_H_MAX_SIZE meshtastic_Telemetry_size
-#define meshtastic_AS3935Config_size             6
+#define meshtastic_AS3935State_size              6
 #define meshtastic_AirQualityMetrics_size        157
 #define meshtastic_DeviceMetrics_size            27
 #define meshtastic_EnvironmentMetrics_size       222
 #define meshtastic_HealthMetrics_size            11
-#define meshtastic_HostMetrics_size              264
+#define meshtastic_HostMetrics_size              225
 #define meshtastic_LocalStats_size               87
-#define meshtastic_LocalStatsExtended_size       42
+#define meshtastic_LocalStatsExtended_size       65
 #define meshtastic_Nau7802Config_size            16
 #define meshtastic_PowerMetrics_size             81
 #define meshtastic_SEN5XState_size               27
 #define meshtastic_SEN6XState_size               27
-#define meshtastic_Telemetry_size                272
+#define meshtastic_SoilWaterMetrics_size         75
+#define meshtastic_Telemetry_size                233
 #define meshtastic_TrafficManagementStats_size   42
 
 #ifdef __cplusplus

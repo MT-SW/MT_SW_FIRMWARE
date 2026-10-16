@@ -104,14 +104,14 @@ void drawRoundedHighlight(OLEDDisplay *display, int16_t x, int16_t y, int16_t w,
 void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *titleStr, bool force_no_invert, bool show_date,
                       bool transparent_background, bool use_title_color_override, uint16_t title_color_override)
 {
-    constexpr int HEADER_OFFSET_Y = 1;
+    constexpr int HEADER_OFFSET_Y = 1 + BASEUI_HEADER_MARGIN;
     y += HEADER_OFFSET_Y;
 
     display->setFont(FONT_SMALL);
     display->setTextAlignment(TEXT_ALIGN_LEFT);
 
-    const int xOffset = 4;
-    const int highlightHeight = FONT_HEIGHT_SMALL - 1;
+    const int xOffset = 4 + BASEUI_HEADER_LR_MARGIN;
+    const int highlightHeight = FONT_HEIGHT_SMALL - 1 + BASEUI_HEADER_MARGIN;
     const bool isInverted = (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_INVERTED);
     const bool isBold = config.display.heading_bold;
 
@@ -250,8 +250,8 @@ void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *ti
     }
 #endif
 
-    int batteryX = 1;
-    int batteryY = HEADER_OFFSET_Y + 1;
+    int batteryX = x + 1 + BASEUI_HEADER_LR_MARGIN;
+    int batteryY = HEADER_OFFSET_Y + 1 + BASEUI_HEADER_MARGIN / 2;
 #if !defined(OLED_TINY)
     // === Battery Icons ===
     if (usbPowered && !isCharging) { // This is a basic check to determine USB Powered is flagged but not charging
@@ -596,7 +596,17 @@ void drawCommonFooter(OLEDDisplay *display, int16_t x, int16_t y)
 
     display->setColor(BLACK);
 #if GRAPHICS_TFT_COLORING_ENABLED
-    display->fillRect(0, footerY, SCREEN_WIDTH, footerH);
+    // The full-width bar reads as a clean footer where there is room below the body, but the band is
+    // the bottom (connection_icon_height + 2) rows and the body grid does not shrink with the panel:
+    // textSixthLine is 58 whatever the height, so on a 64-row display the bar lands exactly on it and
+    // erases the last thing the frame drew (the sixth body line, the LoRa ChUtil bar, the clock).
+    // Only the icon's own rect is colour-tinted, so the wide fill buys the tint nothing - fall back to
+    // the icon-width fill, as the monochrome path already does, whenever it would overlap the body.
+    const int bodyBottom = getTextPositions(display)[6] + FONT_HEIGHT_SMALL;
+    if (footerY >= bodyBottom)
+        display->fillRect(0, footerY, SCREEN_WIDTH, footerH);
+    else
+        display->fillRect(0, footerY, connection_icon_width + 1, footerH);
 #else
     display->fillRect(0, footerY, connection_icon_width + 1, footerH);
 #endif

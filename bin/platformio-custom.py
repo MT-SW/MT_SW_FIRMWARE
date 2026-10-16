@@ -2,7 +2,7 @@
 # trunk-ignore-all(ruff/F821)
 # trunk-ignore-all(flake8/F821): For SConstruct imports
 import sys
-from os.path import join
+from os.path import exists, join
 import subprocess
 import json
 import re
@@ -41,8 +41,11 @@ def infer_architecture(board_cfg):
         return "rp2350"
     if "nrf52" in mcu_l or "nrf52840" in mcu_l:
         return "nrf52840"
+    if "nrf54l15" in mcu_l:
+        return "nrf54l15"
     if "stm32" in mcu_l:
         return "stm32"
+    print(f"mtjson: could not infer architecture from MCU '{mcu_l}'")
     return None
 
 def run_size_tool(env, flag, purpose):
@@ -295,10 +298,42 @@ try:
 except subprocess.CalledProcessError:
     repo_owner = "unknown"
 
-jsonLoc = env["PROJECT_DIR"] + "/userPrefs.jsonc"
-with open(jsonLoc, encoding="utf-8") as f:
-    jsonStr = re.sub("//.*","", f.read(), flags=re.MULTILINE)
-    userPrefs = json.loads(jsonStr)
+def readUserPrefs(path):
+    with open(path) as f:
+        return json.loads(re.sub("//.*", "", f.read(), flags=re.MULTILINE))
+
+
+userPrefs = readUserPrefs(env["PROJECT_DIR"] + "/userPrefs.jsonc")
+# Private per-checkout settings (gitignored), layered over the shared template key by key.
+localPrefsLoc = env["PROJECT_DIR"] + "/userPrefs.local.jsonc"
+if exists(localPrefsLoc):
+    localPrefs = readUserPrefs(localPrefsLoc)
+    userPrefs.update(localPrefs)
+    print(f"userPrefs.local.jsonc overrides {len(localPrefs)} userPrefs")
+
+# Channels::initDefaultChannel() applies a configured index as a whole, so resolve per-field
+# optionality here: any field the vendor left out gets the value that function would have kept.
+MAX_NUM_CHANNELS = 8
+CHANNEL_FIELD_DEFAULTS = {
+    "PSK": "{ 0x01 }",  # short-form index into the well-known default PSK
+    "NAME": "",
+    "PRECISION": "0",
+    "IS_MUTED": "false",
+    "UPLINK_ENABLED": "false",
+    "DOWNLINK_ENABLED": "false",
+}
+channelsToWriteRaw = userPrefs.get("USERPREFS_CHANNELS_TO_WRITE", "1")
+channelsToWrite = int(channelsToWriteRaw, 16 if channelsToWriteRaw.lower().startswith("0x") else 10)
+if channelsToWrite > MAX_NUM_CHANNELS:
+    sys.exit(
+        f"userPrefs.jsonc: USERPREFS_CHANNELS_TO_WRITE is {channelsToWrite}, "
+        f"the channel table holds {MAX_NUM_CHANNELS}"
+    )
+for i in range(MAX_NUM_CHANNELS):
+    prefix = f"USERPREFS_CHANNEL_{i}_"
+    if any(k.startswith(prefix) for k in list(userPrefs)):
+        for field, default in CHANNEL_FIELD_DEFAULTS.items():
+            userPrefs.setdefault(prefix + field, default)
 
 pref_flags = []
 # Pre-process the userPrefs
@@ -306,6 +341,8 @@ for pref in userPrefs:
     if userPrefs[pref].startswith("{"):
         pref_flags.append("-D" + pref + "=" + userPrefs[pref])
     elif userPrefs[pref].lstrip("-").replace(".", "").isdigit():
+        pref_flags.append("-D" + pref + "=" + userPrefs[pref])
+    elif re.fullmatch(r"0[xX][0-9a-fA-F]+", userPrefs[pref]):
         pref_flags.append("-D" + pref + "=" + userPrefs[pref])
     elif userPrefs[pref] == "true" or userPrefs[pref] == "false":
         pref_flags.append("-D" + pref + "=" + userPrefs[pref])

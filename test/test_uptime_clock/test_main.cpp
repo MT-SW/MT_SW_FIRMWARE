@@ -1,8 +1,11 @@
 // Unit tests for src/UptimeClock.{h,cpp} - the monotonic uptime seam.
-// Covers: test-clock injection, stepping the injected clock, the real-clock fallback, and the
-// single-writer wrap carry (readers derive, serviceMonotonic() publishes). getMillis() itself is a
-// plain 32-bit read with no wrap handling of its own - its consumers' wrap arithmetic is tested in
-// test_throttle/.
+// Covers: test-clock injection, stepping the injected clock, the real-clock fallback, the
+// single-writer wrap carry (readers derive, serviceMonotonic() publishes), rejecting a backward-
+// looking tick instead of folding it in as a near-full wrap, dropping a forward glitch a re-read does
+// not repeat, rejecting a second concurrent writer
+// instead of risking a torn read, and the 0-sentinel dodge helpers (skipZero/timerEndsAtMillis).
+// getMillis() itself is a plain 32-bit read with no wrap handling of its own beyond those helpers -
+// deadline/throttle wrap arithmetic built on top of it is tested in test_throttle/.
 #include "Arduino.h"
 #include "TestUtil.h"
 #include "UptimeClock.h"
@@ -68,6 +71,94 @@ void test_advanceTestMillis_wraps_like_millis()
     Time::setTestMillis(0xFFFFFF00u);
     Time::advanceTestMillis(0x200u);
     TEST_ASSERT_EQUAL_UINT32(0x00000100u, Time::getMillis());
+}
+
+// --- skipZero() / timerEndsAtMillis(): dodging the wrap tick that lands on 0 ---
+
+void test_skipZero_maps_zero_to_one()
+{
+    TEST_ASSERT_EQUAL_UINT32(1u, Time::skipZero(0));
+}
+
+void test_skipZero_leaves_nonzero_values_alone()
+{
+    TEST_ASSERT_EQUAL_UINT32(5u, Time::skipZero(5));
+    TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, Time::skipZero(0xFFFFFFFFu));
+}
+
+void test_timerEndsAtMillis_is_an_ordinary_sum_away_from_the_wrap()
+{
+    Time::setTestMillis(1000);
+    TEST_ASSERT_EQUAL_UINT32(1500u, Time::timerEndsAtMillis(500));
+}
+
+// The sum is what has to dodge 0, not the read: a non-zero getMillis() plus a delay can still land
+// exactly on the wrap, which is why this is not skipZero(getMillis()) + delayMs.
+void test_timerEndsAtMillis_dodges_a_sum_that_wraps_to_zero()
+{
+    Time::setTestMillis(0xFFFFFF00u);
+    TEST_ASSERT_EQUAL_UINT32(1u, Time::timerEndsAtMillis(0x100u)); // 0xFFFFFF00 + 0x100 wraps to 0
+}
+
+void test_timerEndsAtMillis_dodges_the_wrap_tick_itself()
+{
+    Time::setTestMillis(0);
+    TEST_ASSERT_EQUAL_UINT32(1u, Time::timerEndsAtMillis(0)); // getMillis()==0, delayMs==0: sum is 0
+}
+
+// --- stampMillis(): one value for storing a stamp AND measuring against it ---
+
+void test_stampMillis_matches_getMillis_away_from_the_wrap()
+{
+    Time::setTestMillis(123456u);
+    TEST_ASSERT_EQUAL_UINT32(123456u, Time::stampMillis());
+}
+
+void test_stampMillis_calls_the_zero_tick_one()
+{
+    Time::setTestMillis(0);
+    TEST_ASSERT_EQUAL_UINT32(1u, Time::stampMillis());
+}
+
+// The regression this helper exists for. Applying skipZero() at the STORE while a reader measures
+// elapsed time against a raw clock splits the two sides apart on the wrap tick: the stamp is 1 while
+// now is still 0, so `now - stamp` is UINT32_MAX and a brand new stamp reads as ~49.7 days old. Any
+// elapsed-since guard - a cooldown, a debounce, a long-press threshold - then fires when it must not.
+void test_store_side_dodge_alone_makes_a_fresh_stamp_read_as_ancient()
+{
+    Time::setTestMillis(0);
+    const uint32_t rawNow = Time::getMillis();              // what an un-normalised reader holds: 0
+    const uint32_t stampedAtStore = Time::skipZero(rawNow); // the old shape: dodge only at the store
+    TEST_ASSERT_EQUAL_UINT32(0u, rawNow);
+    TEST_ASSERT_EQUAL_UINT32(1u, stampedAtStore);
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, (uint32_t)(rawNow - stampedAtStore)); // the whole problem
+}
+
+void test_reading_through_stampMillis_keeps_elapsed_at_zero_on_the_wrap_tick()
+{
+    Time::setTestMillis(0);
+    const uint32_t now = Time::stampMillis(); // read once, used for the store AND the comparison
+    const uint32_t stamp = now;               // store it as-is; no second dodge needed
+    TEST_ASSERT_EQUAL_UINT32(1u, now);
+    TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)(now - stamp)); // fresh reads as fresh
+
+    // Once the clock moves on, the measured age is short by exactly the 1 ms the dodge introduced:
+    // the stamp was taken at tick 0 and recorded as 1, so 400 ticks later it reads as 399 old. That
+    // is the whole cost of the scheme, and it is the same 1 ms skew skipZero() already documents -
+    // pinned here so nobody "corrects" it to 400 and reintroduces a raw read on one side.
+    Time::advanceTestMillis(400u);
+    TEST_ASSERT_EQUAL_UINT32(399u, (uint32_t)(Time::stampMillis() - stamp));
+}
+
+// A stamp stored one tick BEFORE the wrap, read one tick after, must still measure 1 ms - the dodge
+// must not disturb ordinary wrap-crossing arithmetic.
+void test_stampMillis_measures_across_the_wrap_boundary()
+{
+    Time::setTestMillis(0xFFFFFFFFu);
+    const uint32_t stamp = Time::stampMillis();
+    TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, stamp);
+    Time::advanceTestMillis(1u); // wraps to 0, which stampMillis reports as 1
+    TEST_ASSERT_EQUAL_UINT32(2u, (uint32_t)(Time::stampMillis() - stamp));
 }
 
 // --- getMillisMonotonic(): the published wrap carry ---
@@ -144,6 +235,64 @@ void test_monotonic_misses_a_wrap_not_serviced_within_the_window()
     advanceAndService(0x80000000u); // full cycle with no publish in between: low word is 1000 again
 
     TEST_ASSERT_EQUAL_UINT64(1000u, Time::getMillisMonotonic()); // the elapsed 2^32 ms is lost
+}
+
+// Field report: millis() ticked backward by a few ms (clock-domain jitter, not a real wrap), and the
+// wrap carry mistook it for one, permanently adding ~49.7 days to every later reading - the app kept
+// showing "49d ..." uptime while the device's own screen (which formats raw millis(), bypassing this
+// carry entirely) stayed correct. A small backward tick must be a no-op instead.
+void test_monotonic_ignores_small_backward_tick_of_millis()
+{
+    Time::setTestMillis(1517000u); // ~25m17s, matching the last-good reading in the field report
+    Time::serviceMonotonic();
+    TEST_ASSERT_EQUAL_UINT32(1517u, Time::getUptimeSecs());
+
+    Time::setTestMillis(1516995u); // millis() ticked backward by 5ms - jitter, not a wrap
+    Time::serviceMonotonic();
+    TEST_ASSERT_EQUAL_UINT32(1517u, Time::getUptimeSecs()); // held, not credited with +49.7 days
+
+    // Real time keeps moving forward right after the glitch, as it would on hardware.
+    Time::setTestMillis(1518000u);
+    Time::serviceMonotonic();
+    TEST_ASSERT_EQUAL_UINT32(1518u, Time::getUptimeSecs());
+}
+
+// The same glitch, observed by a pure reader with no intervening publish - readers must not see a
+// transient +49.7 day spike either.
+void test_monotonic_reader_ignores_small_backward_tick_without_a_publish()
+{
+    Time::setTestMillis(1517000u);
+    Time::serviceMonotonic();
+
+    Time::setTestMillis(1516995u); // backward tick observed only by a reader, never published
+    TEST_ASSERT_EQUAL_UINT64(1517000u, Time::getMillisMonotonic());
+}
+
+// Field log 2026-09-29 (heltec-v2_1): one millis() read landed 68719476 ms (2^36 us) ahead of the reads
+// around it. serviceMonotonic() published it, every later read then looked like a backward tick, and the
+// clock held at the glitch for ~19 h. A glitch that a second read does not repeat must be dropped.
+void test_monotonic_drops_a_single_forward_glitch_of_millis()
+{
+    Time::setTestMillis(51697216u);
+    Time::serviceMonotonic();
+
+    Time::advanceTestMillis(19);
+    Time::glitchNextTestMillis(51697235u + 68719476u);
+    Time::serviceMonotonic();
+    TEST_ASSERT_EQUAL_UINT64(51697235u, Time::getMillisMonotonic());
+
+    advanceAndService(1000); // and it keeps ticking instead of holding
+    TEST_ASSERT_EQUAL_UINT64(51698235u, Time::getMillisMonotonic());
+}
+
+// The re-read must not cost a genuine long gap between publishes: both reads agree, so it counts.
+void test_monotonic_keeps_a_long_gap_that_a_second_read_confirms()
+{
+    Time::setTestMillis(1000);
+    Time::serviceMonotonic();
+
+    advanceAndService(10 * 60 * 1000); // a main loop blocked for ten minutes
+    TEST_ASSERT_EQUAL_UINT64(1000u + 10 * 60 * 1000, Time::getMillisMonotonic());
 }
 
 void test_getUptimeSecs_stays_exact_across_the_wrap()
@@ -244,6 +393,38 @@ void test_monotonic_reader_completes_while_publish_is_paused()
     TEST_ASSERT_EQUAL_UINT64(101u, readerValue);
 }
 
+// --- concurrent writers ---
+
+// The failure mode UptimeClock.h documents: "Two concurrent callers could count one wrap twice." A
+// second serviceMonotonic() call arriving while the first is still mid-publish - on hardware this
+// would be a preempting BLE/ISR context, not another thread - must back off instead of reading the
+// snapshot the first is actively moving past, so only the first writer's wrap is ever counted.
+void test_monotonic_second_writer_is_rejected_while_a_publish_is_in_flight()
+{
+    Time::setTestMillis(0xFFFFFF00u); // near the wrap
+    Time::serviceMonotonic();
+
+    publishPaused.store(false, std::memory_order_relaxed);
+    releasePublish.store(false, std::memory_order_relaxed);
+    Time::setMonotonicPublishHookForTests(pauseMonotonicPublish);
+
+    Time::advanceTestMillis(0x200u); // crosses the wrap; low word is now 0x100
+    std::thread firstWriter([]() { Time::serviceMonotonic(); });
+    while (!publishPaused.load(std::memory_order_acquire))
+        std::this_thread::yield();
+
+    // Arrives after the first writer has computed and stored its wrap-counted snapshot into the
+    // inactive slot but before it has advanced publishedGeneration. Must be a complete no-op, not a
+    // second attempt to fold the same wrap in again.
+    Time::serviceMonotonic();
+
+    releasePublish.store(true, std::memory_order_release);
+    firstWriter.join();
+    Time::setMonotonicPublishHookForTests(nullptr);
+
+    TEST_ASSERT_EQUAL_UINT64(0x100000100ull, Time::getMillisMonotonic()); // exactly one wrap counted
+}
+
 // --- getTime(): the wall clock must not retreat at the millis() wrap ---
 
 // Epoch used by the wall-clock cases; must sit between BUILD_EPOCH (stamped at build time) and
@@ -337,15 +518,30 @@ void setup()
     RUN_TEST(test_getMillis_returns_injected_value);
     RUN_TEST(test_advanceTestMillis_steps_clock);
     RUN_TEST(test_advanceTestMillis_wraps_like_millis);
+    RUN_TEST(test_skipZero_maps_zero_to_one);
+    RUN_TEST(test_skipZero_leaves_nonzero_values_alone);
+    RUN_TEST(test_stampMillis_matches_getMillis_away_from_the_wrap);
+    RUN_TEST(test_stampMillis_calls_the_zero_tick_one);
+    RUN_TEST(test_store_side_dodge_alone_makes_a_fresh_stamp_read_as_ancient);
+    RUN_TEST(test_reading_through_stampMillis_keeps_elapsed_at_zero_on_the_wrap_tick);
+    RUN_TEST(test_stampMillis_measures_across_the_wrap_boundary);
+    RUN_TEST(test_timerEndsAtMillis_is_an_ordinary_sum_away_from_the_wrap);
+    RUN_TEST(test_timerEndsAtMillis_dodges_a_sum_that_wraps_to_zero);
+    RUN_TEST(test_timerEndsAtMillis_dodges_the_wrap_tick_itself);
     RUN_TEST(test_monotonic_matches_millis_before_any_wrap);
     RUN_TEST(test_monotonic_counts_a_wrap);
     RUN_TEST(test_monotonic_reader_crosses_the_wrap_without_a_publish);
     RUN_TEST(test_monotonic_reads_do_not_advance_the_carry);
     RUN_TEST(test_monotonic_counts_every_wrap_when_serviced_each_window);
     RUN_TEST(test_monotonic_misses_a_wrap_not_serviced_within_the_window);
+    RUN_TEST(test_monotonic_ignores_small_backward_tick_of_millis);
+    RUN_TEST(test_monotonic_reader_ignores_small_backward_tick_without_a_publish);
+    RUN_TEST(test_monotonic_drops_a_single_forward_glitch_of_millis);
+    RUN_TEST(test_monotonic_keeps_a_long_gap_that_a_second_read_confirms);
     RUN_TEST(test_getUptimeSecs_stays_exact_across_the_wrap);
     RUN_TEST(test_monotonic_exact_with_concurrent_readers);
     RUN_TEST(test_monotonic_reader_completes_while_publish_is_paused);
+    RUN_TEST(test_monotonic_second_writer_is_rejected_while_a_publish_is_in_flight);
     RUN_TEST(test_getTime_stays_exact_across_the_wrap);
     RUN_TEST(test_getTime_anchored_after_a_wrap_is_exact);
     RUN_TEST(test_getTime_unaffected_by_concurrent_readers_across_the_wrap);

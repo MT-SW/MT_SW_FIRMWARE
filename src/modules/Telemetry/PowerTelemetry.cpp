@@ -1,3 +1,4 @@
+#include "UptimeClock.h"
 #include "configuration.h"
 
 #if !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
@@ -105,7 +106,7 @@ int32_t PowerTelemetryModule::runOnce()
             // Just send to phone when it's not our time to send to mesh yet
             // Only send while queue is empty (phone assumed connected)
             sendTelemetry(NODENUM_BROADCAST, true);
-            lastSentToPhone = millis();
+            lastSentToPhone = Time::skipZero(Time::getMillis());
         }
     }
     if (sleepOnNextExecution) {
@@ -212,7 +213,7 @@ bool PowerTelemetryModule::handleReceivedProtobuf(const meshtastic_MeshPacket &m
 bool PowerTelemetryModule::getPowerTelemetry(meshtastic_Telemetry *m)
 {
     bool valid = false;
-    m->time = getTime();
+    m->time = getValidTime(RTCQualityFromNet); // 0 (field omitted) until the clock is set, never a boot-relative 1970 time
     m->which_variant = meshtastic_Telemetry_power_metrics_tag;
 
     m->variant.power_metrics = meshtastic_PowerMetrics_init_zero;
@@ -269,7 +270,7 @@ bool PowerTelemetryModule::sendTelemetry(NodeNum dest, bool phoneOnly)
 {
     meshtastic_Telemetry m = meshtastic_Telemetry_init_zero;
     m.which_variant = meshtastic_Telemetry_power_metrics_tag;
-    m.time = getTime();
+    m.time = getValidTime(RTCQualityFromNet);
     bool validTelemetry = getPowerTelemetry(&m);
     if (validTelemetry) {
         LOG_INFO("Send: ch1_voltage=%f, ch2_voltage=%f, ch3_voltage=%f", m.variant.power_metrics.ch1_voltage,

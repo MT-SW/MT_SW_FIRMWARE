@@ -110,7 +110,12 @@ class Channels
 
     bool ensureLicensedOperation();
 
-    bool setDefaultPresetCryptoForHash(ChannelHash channelHash);
+    // Bridge fallback for decryptForHash(): tries the default PSK against each preset name listed in
+    // mesh/udp/UdpBridgePresets.h (instead of every known preset), plus "Custom" when UDP_BRIDGE_CUSTOM
+    // is set, and on a match sets up crypto for it. Always declared; the body is a no-op returning false
+    // unless UDP_PRESET_BRIDGE is enabled for this build, so callers don't need their own ifdef. See
+    // Router.cpp's UDP multicast decode fallback for the only caller.
+    bool setBridgePresetCryptoForHash(ChannelHash channelHash);
 
     /**
      * Validate a channel, fixing any errors as needed
@@ -118,6 +123,15 @@ class Channels
     meshtastic_Channel &fixupChannel(ChannelIndex chIndex);
 
     int16_t getHash(ChannelIndex i) { return hashes[i]; }
+
+    /** Return true if the channel has AEAD (authenticated encryption) enabled */
+    bool isAEADEnabled(ChannelIndex chIndex);
+
+    /**
+     * Return the key used for encrypting this channel (if channel is secondary and no key provided, use the primary channel's
+     * PSK)
+     */
+    CryptoKey getKey(ChannelIndex chIndex);
 
   private:
     /** Given a channel index, change to use the crypto key specified by that index
@@ -145,12 +159,6 @@ class Channels
      * Write default channels defined in UserPrefs
      */
     void initDefaultChannel(ChannelIndex chIndex);
-
-    /**
-     * Return the key used for encrypting this channel (if channel is secondary and no key provided, use the primary channel's
-     * PSK)
-     */
-    CryptoKey getKey(ChannelIndex chIndex);
 };
 
 /// Singleton channel table
@@ -159,6 +167,10 @@ extern Channels channels;
 /// 16 bytes of random PSK for our _public_ default channel that all devices power up on (AES128)
 static const uint8_t defaultpsk[] = {0xd4, 0xf1, 0xbb, 0x3a, 0x20, 0x29, 0x07, 0x59,
                                      0xf0, 0xbc, 0xff, 0xab, 0xcf, 0x4e, 0x69, 0x01};
+
+/// True if the user muted the source of this packet: the sender for a DM addressed to us,
+/// otherwise the channel it arrived on.
+bool isMutedForPacket(const meshtastic_MeshPacket &mp);
 
 /// True if a getKey()-resolved key offers no privacy: length 0 (off) or the public defaultpsk family. Pure; for tests.
 bool cryptoKeyIsPublic(const CryptoKey &key);

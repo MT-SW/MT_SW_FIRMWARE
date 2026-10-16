@@ -14,6 +14,7 @@
 #include "SX1262Interface.h"
 #include "SX1268Interface.h"
 #include "SX1280Interface.h"
+#include "UptimeClock.h"
 #include "configuration.h"
 #include "detect/LoRaRadioType.h"
 #include "main.h"
@@ -99,10 +100,17 @@ Observable<uint32_t> RadioInterface::loraRxPacketObservable;
 
 #define RDEF(name, freq_start, freq_end, duty_cycle, power_limit, frequency_switching, wide_lora, profile_ptr, default_preset,   \
              override_slot)                                                                                                      \
-    {                                                                                                                            \
-        meshtastic_Config_LoRaConfig_RegionCode_##name, freq_start, freq_end, duty_cycle, power_limit, frequency_switching,      \
-            wide_lora, &profile_ptr, default_preset, override_slot, #name                                                        \
-    }
+    {meshtastic_Config_LoRaConfig_RegionCode_##name,                                                                             \
+     freq_start,                                                                                                                 \
+     freq_end,                                                                                                                   \
+     duty_cycle,                                                                                                                 \
+     power_limit,                                                                                                                \
+     frequency_switching,                                                                                                        \
+     wide_lora,                                                                                                                  \
+     &profile_ptr,                                                                                                               \
+     default_preset,                                                                                                             \
+     override_slot,                                                                                                              \
+     #name}
 
 const RegionInfo regions[] = {
     /*
@@ -415,6 +423,7 @@ std::unique_ptr<RadioInterface> initLoRa()
               portduino_config.lora_spi_dev.c_str());
     if (portduino_config.lora_spi_dev == "ch341") {
         RadioLibHAL = ch341Hal.get(); // non-owning: the ch341 HAL stays owned by the global unique_ptr
+        ch341Hal->setRadioPins(portduino_config.lora_cs_pin.pin, portduino_config.lora_busy_pin.pin);
     } else {
         if (RadioLibHAL != nullptr) {
             delete RadioLibHAL;
@@ -643,7 +652,7 @@ std::unique_ptr<RadioInterface> initLoRa()
             if (screen) {
                 screen->showSimpleBanner("Rebooting...");
             }
-            rebootAtMsec = millis() + 5000;
+            rebootAtMsec = Time::timerEndsAtMillis(5000);
         }
     }
     return rIf;
@@ -744,6 +753,26 @@ void getRegionPresetMap(meshtastic_LoRaRegionPresetMap &map)
         rg.region = r->code;
         rg.group_index = (uint8_t)gi;
     }
+
+#ifdef USERPREFS_LORACONFIG_MODEM_PRESET
+    // A pinned preset is a statement of intent, not enforcement: supportsPreset() still accepts any
+    // known preset while unset. Stock builds emit no UNSET entry, which clients read as unconstrained.
+    if (map.groups_count < maxGroups && map.region_groups_count < maxRegions) {
+        const RegionInfo *unset = getRegion(meshtastic_Config_LoRaConfig_RegionCode_UNSET);
+        meshtastic_LoRaPresetGroup &grp = map.groups[map.groups_count];
+        grp.presets_count = 1;
+        grp.presets[0] = USERPREFS_LORACONFIG_MODEM_PRESET;
+        grp.default_preset = USERPREFS_LORACONFIG_MODEM_PRESET;
+        grp.licensed_only = unset->profile->licensedOnly;
+
+        meshtastic_LoRaRegionPresets &rg = map.region_groups[map.region_groups_count++];
+        rg.region = unset->code;
+        rg.group_index = (uint8_t)map.groups_count++;
+    } else {
+        // Costs only the intent signal - clients fall back to unconstrained - but must not be silent.
+        LOG_ERROR("Region preset map full; UNSET intent omitted");
+    }
+#endif
 }
 
 /**
@@ -789,6 +818,30 @@ uint32_t RadioInterface::getRetransmissionMsec(const meshtastic_MeshPacket *p)
     // Assuming we pick max. of CWsize and there will be a client with SNR at half the range
     return 2 * packetAirtime + (pow_of_2(CWsize) + 2 * CWmax + pow_of_2(int((CWmax + CWmin) / 2))) * slotTimeMsec +
            PROCESSING_TIME_MSEC;
+}
+
+/** True when this node is the origin of the packet, rather than relaying one another node sent.
+ *
+ * Only an origination may use the short getTxDelayMsec() backoff. A relay has to sit out the
+ * 2 * CWmax slot offset that getTxDelayMsecWeighted() adds, otherwise it transmits inside the
+ * originator's own contention window and the two copies race each other instead of flooding outward.
+ *
+ * This used to be inferred from `rx_snr == 0 && rx_rssi == 0`, on the theory that the radio's
+ * noise-floor offset keeps a genuine reception from ever reading as exactly zero. That holds for LoRa
+ * and for nothing else: a packet that reached us over UDP multicast or MQTT carries no RF measurement
+ * at all (UdpMulticastHandler::onReceive() zeroes both fields explicitly, MQTT::onReceive() allocates
+ * them zeroed), so relaying one was scheduled as if we had written it - and every off-air-fed relay
+ * beat every LoRa-fed relay onto the air by that whole offset. transport_mechanism records provenance
+ * directly, which is what the question was always about, so ask it instead of guessing from the RF fields.
+ *
+ * TRANSPORT_API counts as ours: a local client handed us that packet over the packet API and we are
+ * its originator. Everything else - including a transport this firmware does not set yet, and whatever
+ * a client may put in the field - counts as a relay, because that is the safe direction for the channel.
+ */
+bool RadioInterface::isLocallyOriginated(const meshtastic_MeshPacket *p)
+{
+    return p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_INTERNAL ||
+           p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_API;
 }
 
 /** The delay to use when we want to send something */
@@ -845,11 +898,11 @@ uint32_t RadioInterface::getTxDelayMsecWeighted(meshtastic_MeshPacket *p)
     // LOG_DEBUG("rx_snr of %f so setting CWsize to:%d", snr, CWsize);
     if (shouldRebroadcastEarlyLikeRouter(p)) {
         delay = random(0, 2 * CWsize) * slotTimeMsec;
-        LOG_DEBUG("rx_snr in packet. Router: tx delay:%d", delay);
+        LOG_DEBUG_RADIO("rx_snr in packet. Router: tx delay:%d", delay);
     } else {
         // offset the maximum delay for routers: (2 * CWmax * slotTimeMsec)
         delay = (2 * CWmax * slotTimeMsec) + random(0, pow_of_2(CWsize)) * slotTimeMsec;
-        LOG_DEBUG("rx_snr in packet. Tx delay:%d", delay);
+        LOG_DEBUG_RADIO("rx_snr in packet. Tx delay:%d", delay);
     }
 
     return delay;
@@ -1396,17 +1449,25 @@ void RadioInterface::applyModemConfig()
   - roundtrip air propagation time (assuming max. 30km between nodes);
   - Tx/Rx turnaround time (maximum of SX126x and SX127x);
   - MAC processing time (measured on T-beam) */
+uint8_t RadioInterface::getCadSymbolCount() const
+{
+    return myRegion->wideLora ? getCadSymbolCountWideLora() : getCadSymbolCountSubGhz();
+}
+
 uint32_t RadioInterface::computeSlotTimeMsec()
 {
     float sumPropagationTurnaroundMACTime = 0.2 + 0.4 + 7; // in milliseconds
     float symbolTime = pow_of_2(sf) / bw;                  // in milliseconds
 
     if (myRegion->wideLora) {
-        // CAD duration derived from AN1200.22 of SX1280
-        return (NUM_SYM_CAD_24GHZ + (2 * sf + 3) / 32) * symbolTime + sumPropagationTurnaroundMACTime;
+        // SX1280 datasheet rev 3.3: CAD duration = (cadSymbolNum + (2*SF + 3) / 32) * Ts, the trailing
+        // term being the post-scan processing window. Float division: as ints it truncates to 0 for
+        // every legal SF. SX1280, LR1120 and LR2021 all run here, so take the count from the driver.
+        return (getCadSymbolCount() + (2.0f * sf + 3) / 32) * symbolTime + sumPropagationTurnaroundMACTime;
     } else {
-        // CAD duration for SX127x is max. 2.25 symbols, for SX126x it is number of symbols + 0.5 symbol
-        return max(2.25, NUM_SYM_CAD + 0.5) * symbolTime + sumPropagationTurnaroundMACTime;
+        // CAD duration for SX127x is max. 2.25 symbols, for SX126x it is number of symbols + 0.5 symbol.
+        // getCadSymbolCount() reports the symbols the scan really runs.
+        return max(2.25, getCadSymbolCount() + 0.5) * symbolTime + sumPropagationTurnaroundMACTime;
     }
 }
 
@@ -1478,7 +1539,13 @@ void RadioInterface::deliverToReceiver(meshtastic_MeshPacket *p)
 size_t RadioInterface::beginSending(meshtastic_MeshPacket *p)
 {
     assert(!sendingPacket);
+    const size_t numbytes = encodeRadioBuffer(p);
+    sendingPacket = p;
+    return numbytes;
+}
 
+size_t RadioInterface::encodeRadioBuffer(meshtastic_MeshPacket *p)
+{
     // LOG_DEBUG("Send queued packet on mesh (txGood=%d,rxGood=%d,rxBad=%d)", rf95.txGood(), rf95.rxGood(), rf95.rxBad());
     assert(p->which_payload_variant == meshtastic_MeshPacket_encrypted_tag); // It should have already been encoded by now
 
@@ -1498,9 +1565,16 @@ size_t RadioInterface::beginSending(meshtastic_MeshPacket *p)
 
     // if the sender nodenum is zero, that means uninitialized
     assert(radioBuffer.header.from);
-    assert(p->encrypted.size <= sizeof(radioBuffer.payload));
-    memcpy(radioBuffer.payload, p->encrypted.bytes, p->encrypted.size);
 
-    sendingPacket = p;
-    return p->encrypted.size + sizeof(PacketHeader);
+    // Oversize is rejected at the radio queue in Router::send(); clamp rather than fail here so this
+    // stays a call that always succeeds, with no failure return for startSend() to unwind.
+    size_t payloadLen = p->encrypted.size;
+    if (payloadLen > MAX_RADIO_PAYLOAD_LEN) {
+        LOG_ERROR("Payload %u exceeds radioBuffer capacity %u, truncate", (unsigned)payloadLen, (unsigned)MAX_RADIO_PAYLOAD_LEN);
+        payloadLen = MAX_RADIO_PAYLOAD_LEN;
+    }
+
+    memcpy(radioBuffer.payload, p->encrypted.bytes, payloadLen);
+
+    return payloadLen + sizeof(PacketHeader);
 }
