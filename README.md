@@ -8,6 +8,8 @@ Custom firmware fork for the **Świętokrzyskie (MT_SW)** LoRa mesh network, bas
 
 🌐 [mt-sw.pl](https://mt-sw.pl)
 
+👥 Autorzy / Authors: **Spontaniczne Majsterkowanie** & **cheaterenator** — wspólny projekt / joint project
+
 ---
 
 ## 🇵🇱 Polski
