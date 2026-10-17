@@ -80,6 +80,7 @@ To zmodyfikowana wersja oficjalnego firmware'u Meshtastic, dostosowana do potrze
 - **`rak_killer_v2`** — SuperMini nRF52840 + moduł Heltec HT-RA62 na dedykowanej płytce DIY.
 - **`ikoka_s3`**, **`ikoka_s3_433`** i **`ikoka_s3_e22p`** — warianty na bazie Seeed XIAO S3, m.in. z modułem eByte E22P-868M30S.
 - **`ikoka_c6`**, **`ikoka_c6_433`** i **`ikoka_c6_e22p`** — nowe warianty dla ESP32-C6.
+- **`elecrow-adv1-43-50-70-v15-tft`** — Elecrow CrowPanel Advance 4.3"/5.0"/7.0" w wersji płyty 1.4/1.5 (sterownik STC8H1K28, radio SX1262 z CS na GPIO8). Dla starszych płyt (1.0/1.1) nadal służy `elecrow-adv1-43-50-70-tft`.
 
 ### Autorzy
 - **Spontaniczne Majsterkowanie** — integracja z siecią MT_SW, konfiguracja regionalna, dokumentacja
@@ -163,6 +164,7 @@ This is a modified version of the official Meshtastic firmware, tailored for the
 - **`rak_killer_v2`** — SuperMini nRF52840 + Heltec HT-RA62 module on a dedicated DIY breakout board.
 - **`ikoka_s3`**, **`ikoka_s3_433`** and **`ikoka_s3_e22p`** — Seeed XIAO S3-based variants, including one with the eByte E22P-868M30S module.
 - **`ikoka_c6`**, **`ikoka_c6_433`** and **`ikoka_c6_e22p`** — new variants for ESP32-C6.
+- **`elecrow-adv1-43-50-70-v15-tft`** — Elecrow CrowPanel Advance 4.3"/5.0"/7.0" board revision 1.4/1.5 (STC8H1K28 controller, SX1262 radio with CS on GPIO8). Older boards (1.0/1.1) still use `elecrow-adv1-43-50-70-tft`.
 
 ### Credits
 - **Spontaniczne Majsterkowanie** — MT_SW network integration, regional configuration, documentation

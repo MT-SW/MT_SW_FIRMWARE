@@ -16,8 +16,9 @@
 #define DAC_I2S_WS 11
 #define DAC_I2S_DOUT 12
 #define DAC_I2S_MCLK 8 // don't use GPIO0 because it's assigned to LoRa or button
-#else
+#elif !defined(CROW_HW_STC8H)
 #define PIN_BUZZER 8
+// HW rev 1.4/1.5 (CROW_HW_STC8H): GPIO8 is the SX1262 CS line and the buzzer is driven by the STC8H1K28 MCU, so no PIN_BUZZER
 #endif
 
 // GPS via UART1 connector
@@ -72,7 +73,13 @@
 #define SENSOR_POWER_ON LOW
 #else
 // 4.3", 5.0", 7.0"
+#if defined(CROW_HW_STC8H)
+// HW rev 1.4/1.5: SX1262 NSS is wired directly to GPIO8 (no GPIO0 jumper needed)
+#define LORA_CS 8
+#else
+// HW rev 1.0/1.1: SX1262 NSS reaches GPIO0 via jumper
 #define LORA_CS 0
+#endif
 #define LORA_SCK 5
 #define LORA_MISO 4
 #define LORA_MOSI 6
