@@ -1,0 +1,216 @@
+name: Build firmware (wybierane pliki) / Build firmware (selectable files)
+
+# Ręcznie: zakładka Actions -> "Build firmware" -> Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag wydania, np. v3(2.8.2) / Release tag"
+        required: true
+        type: string
+      esp_bin:
+        description: "ESP: zwykły .bin (do web flashera) / plain .bin"
+        type: boolean
+        default: true
+      esp_factory:
+        description: "ESP: .factory.bin / factory image"
+        type: boolean
+        default: true
+      nrf_uf2:
+        description: "nRF: .uf2 (wgrywanie kablem) / UF2"
+        type: boolean
+        default: true
+      nrf_zip:
+        description: "nRF: .zip (wgrywanie po BT, aplikacja DFU) / DFU zip"
+        type: boolean
+        default: true
+      level:
+        description: "Które warianty / Which variants"
+        type: choice
+        default: release
+        options:
+          - release
+          - release+extra
+          - pr
+      only_env:
+        description: "Tylko jeden wariant (opcjonalnie), np. rak4631 / Single env (optional)"
+        required: false
+        type: string
+        default: ""
+      build_flags:
+        description: "Dodatkowe flagi, np. -DAUTO_REBOOT_INTERVAL_SECS=604800 (opcjonalnie)"
+        required: false
+        type: string
+        default: ""
+      prerelease:
+        description: "Oznacz jako pre-release / Mark as pre-release"
+        type: boolean
+        default: false
+      publish:
+        description: "Opublikuj wydanie (odznacz = zostaje szkic) / Publish (unchecked = draft)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      count: ${{ steps.matrix.outputs.count }}
+      version: ${{ steps.matrix.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Check selection
+        run: |
+          if [ "${{ inputs.esp_bin }}" != "true" ] && [ "${{ inputs.esp_factory }}" != "true" ] \
+             && [ "${{ inputs.nrf_uf2 }}" != "true" ] && [ "${{ inputs.nrf_zip }}" != "true" ]; then
+            echo "::error::Zaznacz przynajmniej jeden typ pliku"; exit 1
+          fi
+
+      - name: Generate matrix
+        id: matrix
+        run: |
+          case "${{ inputs.level }}" in
+            release)        LEVEL_ARGS="" ;;
+            release+extra)  LEVEL_ARGS="--level extra" ;;
+            pr)             LEVEL_ARGS="--level pr" ;;
+          esac
+          python3 bin/generate_ci_matrix.py all $LEVEL_ARGS > all.json
+          python3 - <<'PY'
+          import json, os
+          rows = json.load(open("all.json"))
+          want_esp = os.environ.get("WANT_ESP") == "true"
+          want_nrf = os.environ.get("WANT_NRF") == "true"
+          only = os.environ.get("ONLY", "").strip()
+          out = []
+          for r in rows:
+              p = r["platform"]
+              if p.startswith("esp32") and want_esp:
+                  out.append({"board": r["board"], "kind": "esp"})
+              elif p == "nrf52840" and want_nrf:
+                  out.append({"board": r["board"], "kind": "nrf"})
+          if only:
+              out = [o for o in out if o["board"] == only]
+          if not out:
+              raise SystemExit("Brak wariantow do zbudowania / nothing to build")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": out}) + "\n")
+              f.write(f"count={len(out)}\n")
+          print(f"Do zbudowania: {len(out)}")
+          PY
+          echo "version=$(python3 bin/buildinfo.py long)" >> "$GITHUB_OUTPUT"
+        env:
+          WANT_ESP: ${{ inputs.esp_bin || inputs.esp_factory }}
+          WANT_NRF: ${{ inputs.nrf_uf2 || inputs.nrf_zip }}
+          ONLY: ${{ inputs.only_env }}
+
+      - name: Create draft release (if missing)
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG już istnieje - dokładam pliki"
+          else
+            FLAGS="--draft"
+            [ "${{ inputs.prerelease }}" = "true" ] && FLAGS="$FLAGS --prerelease"
+            gh release create "$TAG" $FLAGS --target "${{ github.sha }}" \
+              --title "$TAG" --notes "Build in progress"
+          fi
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    name: ${{ matrix.board }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Base setup
+        uses: ./.github/actions/setup-base
+
+      - name: PlatformIO cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.platformio/.cache
+          key: pio-cache-${{ matrix.kind }}-${{ hashFiles('**.ini') }}
+
+      - name: Build ${{ matrix.board }}
+        env:
+          PLATFORMIO_BUILD_FLAGS: ${{ inputs.build_flags }}
+        run: |
+          export APP_VERSION="${{ needs.prepare.outputs.version }}"
+          pio run --environment "${{ matrix.board }}" -t mtjson
+
+      - name: Collect selected files
+        run: |
+          B=".pio/build/${{ matrix.board }}"
+          V="${{ needs.prepare.outputs.version }}"
+          N="MT_SW_firmware-${{ matrix.board }}-$V"
+          mkdir -p out
+          if [ "${{ matrix.kind }}" = "esp" ]; then
+            if [ "${{ inputs.esp_bin }}" = "true" ]; then cp "$B/$N.bin" out/; fi
+            if [ "${{ inputs.esp_factory }}" = "true" ]; then cp "$B/$N.factory.bin" out/; fi
+          else
+            if [ "${{ inputs.nrf_uf2 }}" = "true" ]; then cp "$B/$N.uf2" out/; fi
+            if [ "${{ inputs.nrf_zip }}" = "true" ]; then cp "$B/$N.zip" "out/$N-ota.zip"; fi
+          fi
+          ls -la out
+
+      - name: Upload to release
+        run: gh release upload "$TAG" out/* --clobber
+
+      - name: Keep as artifact (backup, 7 days)
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.board }}
+          path: out/*
+          retention-days: 7
+
+  bundle:
+    needs: [prepare, build]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Make one archive with everything and finish release
+        run: |
+          mkdir all && cd all
+          gh release download "$TAG" \
+            --pattern '*.bin' --pattern '*.uf2' --pattern '*.zip' \
+            --skip-existing
+          rm -f *-all.zip
+          mkdir -p ESP32 NRF52
+          mv -f *.bin ESP32/ 2>/dev/null || true
+          mv -f *.uf2 *.zip NRF52/ 2>/dev/null || true
+          ALL="MT_SW_firmware-${{ needs.prepare.outputs.version }}-all.zip"
+          zip -r -q "../$ALL" ESP32 NRF52
+          cd ..
+          ls -la "$ALL"
+          gh release upload "$TAG" "$ALL" --clobber
+          if [ "${{ inputs.publish }}" = "true" ]; then
+            gh release edit "$TAG" --draft=false
+          fi
+          echo "### Gotowe: $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pliki: ${{ needs.prepare.outputs.count }} wariantów + jedno archiwum \`$ALL\`" >> "$GITHUB_STEP_SUMMARY"
